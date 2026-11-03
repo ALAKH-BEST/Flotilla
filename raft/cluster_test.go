@@ -3,33 +3,43 @@ package raft_test
 import (
 	"bytes"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/ALAKH-BEST/flotilla/kv"
 	"github.com/ALAKH-BEST/flotilla/raft"
 	"github.com/ALAKH-BEST/flotilla/simnet"
 )
 
-// cluster runs several nodes over a simulated network and records what each one applies.
+// cluster runs several nodes over a simulated network. Each node feeds a key-value
+// store, and the cluster records what every node applies so replicas can be compared.
 type cluster struct {
-	t        *testing.T
-	net      *simnet.Network
-	n        int
-	storages []*raft.MemoryStorage
-	nodes    []*raft.Node
-	running  []bool
-	cut      []bool // isolated from the network
+	t         *testing.T
+	net       *simnet.Network
+	n         int
+	snapEvery int // take a snapshot every this many applied entries (0 = never)
+	storages  []*raft.MemoryStorage
+	nodes     []*raft.Node
+	stores    []*kv.Store
+	running   []bool
+	cut       []bool // isolated from the network
 
 	mu        sync.Mutex
-	applied   []map[int]raft.ApplyMsg // per node: index -> entry
-	committed map[int]raft.ApplyMsg   // first entry seen at each index, to compare replicas
-	lastIndex []int
+	committed map[int]raft.ApplyMsg // first entry seen at each index, to compare replicas
+	lastIndex []int                 // per node: highest index applied (or covered by an installed snapshot)
+	installed []int                 // per node: snapshots handed to its state machine
 }
 
-func newCluster(t *testing.T, n int) *cluster {
+func newCluster(t *testing.T, n int) *cluster { return newSnapshotCluster(t, n, 0) }
+
+func newSnapshotCluster(t *testing.T, n, snapEvery int) *cluster {
 	t.Helper()
 	c := &cluster{
+		snapEvery: snapEvery,
+		stores:    make([]*kv.Store, n),
+		installed: make([]int, n),
 		t:         t,
 		net:       simnet.New(1),
 		n:         n,
@@ -37,7 +47,6 @@ func newCluster(t *testing.T, n int) *cluster {
 		nodes:     make([]*raft.Node, n),
 		running:   make([]bool, n),
 		cut:       make([]bool, n),
-		applied:   make([]map[int]raft.ApplyMsg, n),
 		committed: make(map[int]raft.ApplyMsg),
 		lastIndex: make([]int, n),
 	}
@@ -72,8 +81,9 @@ func (c *cluster) start(i int) {
 		c.t.Fatalf("node %d: %v", i, err)
 	}
 	c.mu.Lock()
-	c.applied[i] = make(map[int]raft.ApplyMsg) // a restarted node replays its log from index 1
+	c.stores[i] = kv.NewStore() // the state machine is lost in a crash and rebuilt from the snapshot and log
 	c.lastIndex[i] = 0
+	c.installed[i] = 0
 	c.mu.Unlock()
 	c.nodes[i] = node
 	c.running[i] = true
@@ -82,16 +92,25 @@ func (c *cluster) start(i int) {
 	node.Start()
 }
 
-// consume records applied entries and checks them against what other nodes applied.
+// consume feeds a node's state machine and checks what it applies against the other nodes.
 func (c *cluster) consume(i int, ch <-chan raft.ApplyMsg, node *raft.Node) {
 	for msg := range ch {
 		c.mu.Lock()
-		if c.nodes[i] == node { // ignore stragglers from a stopped incarnation
+		if c.nodes[i] != node { // a straggler from a stopped incarnation
+			c.mu.Unlock()
+			continue
+		}
+		store := c.stores[i]
+		snapshotAt := 0
+		if msg.SnapshotValid {
+			c.lastIndex[i] = msg.SnapshotIndex
+			c.installed[i]++
+			store.Apply(msg)
+		} else {
 			if msg.Index != c.lastIndex[i]+1 {
 				c.t.Errorf("node %d applied index %d after %d: entries must arrive in order", i, msg.Index, c.lastIndex[i])
 			}
 			c.lastIndex[i] = msg.Index
-			c.applied[i][msg.Index] = msg
 			if prev, ok := c.committed[msg.Index]; ok {
 				if prev.Term != msg.Term || !bytes.Equal(prev.Command, msg.Command) || prev.NoOp != msg.NoOp {
 					c.t.Errorf("replicas disagree at index %d: %+v vs %+v", msg.Index, prev, msg)
@@ -99,8 +118,21 @@ func (c *cluster) consume(i int, ch <-chan raft.ApplyMsg, node *raft.Node) {
 			} else {
 				c.committed[msg.Index] = msg
 			}
+			store.Apply(msg)
+			if c.snapEvery > 0 && msg.Index%c.snapEvery == 0 {
+				snapshotAt = msg.Index
+			}
+		}
+		var data []byte
+		if snapshotAt > 0 {
+			data = store.Snapshot()
 		}
 		c.mu.Unlock()
+		if snapshotAt > 0 {
+			if err := node.Snapshot(snapshotAt, data); err != nil {
+				c.t.Errorf("node %d: snapshot at %d: %v", i, snapshotAt, err)
+			}
+		}
 	}
 }
 
@@ -184,13 +216,17 @@ func (c *cluster) checkNoLeader() {
 	}
 }
 
-// appliedCount reports how many nodes applied the given command at the given index.
+// appliedCount reports how many nodes have applied the given command at the given index.
+// A node that got there through a snapshot counts too.
 func (c *cluster) appliedCount(index int, cmd []byte) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if m, ok := c.committed[index]; !ok || !bytes.Equal(m.Command, cmd) {
+		return 0
+	}
 	count := 0
 	for i := 0; i < c.n; i++ {
-		if m, ok := c.applied[i][index]; ok && bytes.Equal(m.Command, cmd) {
+		if c.lastIndex[i] >= index {
 			count++
 		}
 	}
@@ -243,3 +279,39 @@ func (c *cluster) waitApplied(i, index int) {
 }
 
 func cmd(format string, args ...any) []byte { return []byte(fmt.Sprintf(format, args...)) }
+
+// put submits a key-value write and waits until `want` nodes applied it.
+func (c *cluster) put(key, value string, want int) int {
+	c.t.Helper()
+	return c.submit(kv.Encode(kv.Command{Op: kv.OpPut, Key: key, Value: value}), want)
+}
+
+// waitStoresEqual waits until every running node holds the same data, and returns it.
+func (c *cluster) waitStoresEqual() map[string]string {
+	c.t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		c.mu.Lock()
+		var first map[string]string
+		equal := true
+		for i := 0; i < c.n; i++ {
+			if !c.running[i] {
+				continue
+			}
+			data := c.stores[i].Data()
+			if first == nil {
+				first = data
+			} else if !reflect.DeepEqual(first, data) {
+				equal = false
+			}
+		}
+		c.mu.Unlock()
+		if equal {
+			return first
+		}
+		if time.Now().After(deadline) {
+			c.t.Fatal("replicas did not converge to the same data")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

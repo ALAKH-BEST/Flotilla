@@ -120,6 +120,12 @@ func (e *endpoint) AppendEntries(to int, args *raft.AppendEntriesArgs) (*raft.Ap
 	return reply, err
 }
 
+func (e *endpoint) InstallSnapshot(to int, args *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
+	var reply *raft.InstallSnapshotReply
+	err := e.net.deliver(e.from, to, func(h raft.Handler) { reply = h.HandleInstallSnapshot(args) })
+	return reply, err
+}
+
 // leg decides whether one message from a to b gets through and how long it takes.
 func (n *Network) leg(from, to int) (h raft.Handler, delay time.Duration, ok bool) {
 	n.mu.Lock()

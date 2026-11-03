@@ -11,12 +11,19 @@ type Entry struct {
 	NoOp bool
 }
 
-// ApplyMsg is delivered, in log order, once an entry is committed.
+// ApplyMsg is delivered, in order, to the state machine. It is either a committed
+// log entry or, when SnapshotValid is set, a snapshot that replaces the state
+// machine's whole state (after a restart, or when this node fell too far behind).
 type ApplyMsg struct {
 	Index   int
 	Term    int
 	Command []byte
 	NoOp    bool
+
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotIndex int
+	SnapshotTerm  int
 }
 
 type RequestVoteArgs struct {
@@ -50,6 +57,19 @@ type AppendEntriesReply struct {
 	ConflictIndex int
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderID          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	// Data is the whole snapshot in one message. Large snapshots would need chunking.
+	Data []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 // Role is the part of the protocol a node is currently playing.
 type Role int
 
@@ -80,4 +100,8 @@ type Status struct {
 	LeaderID     int
 	CommitIndex  int
 	LastLogIndex int
+	// SnapshotIndex is the last index covered by the node's snapshot (0 if none), and
+	// LogEntries is how many entries it still holds in memory after that point.
+	SnapshotIndex int
+	LogEntries    int
 }

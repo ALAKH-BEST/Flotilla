@@ -2,12 +2,23 @@ package raft
 
 import "sync"
 
-// State is what a node must keep across restarts (Figure 2 of the Raft paper).
-// Log includes the sentinel entry at index 0.
+// State is what a node must keep across restarts (Figure 2 of the Raft paper) plus
+// its latest snapshot. Log[0] is a sentinel standing for the entry at SnapshotIndex
+// (index 0 when there is no snapshot), so Log[i] is the entry at SnapshotIndex+i.
+// Everything is saved together so a snapshot and the log that follows it never disagree.
 type State struct {
-	CurrentTerm int
-	VotedFor    int
-	Log         []Entry
+	CurrentTerm   int
+	VotedFor      int
+	Log           []Entry
+	SnapshotIndex int
+	SnapshotTerm  int
+	Snapshot      []byte
+}
+
+func (s State) clone() State {
+	s.Log = append([]Entry(nil), s.Log...)
+	s.Snapshot = append([]byte(nil), s.Snapshot...)
+	return s
 }
 
 // Storage persists State. Save must not return until the state is durable.
@@ -30,11 +41,7 @@ func NewMemoryStorage() *MemoryStorage { return &MemoryStorage{} }
 func (m *MemoryStorage) Save(state State) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.state = State{
-		CurrentTerm: state.CurrentTerm,
-		VotedFor:    state.VotedFor,
-		Log:         append([]Entry(nil), state.Log...),
-	}
+	m.state = state.clone()
 	m.saved = true
 	return nil
 }
@@ -45,9 +52,5 @@ func (m *MemoryStorage) Load() (State, bool, error) {
 	if !m.saved {
 		return State{}, false, nil
 	}
-	return State{
-		CurrentTerm: m.state.CurrentTerm,
-		VotedFor:    m.state.VotedFor,
-		Log:         append([]Entry(nil), m.state.Log...),
-	}, true, nil
+	return m.state.clone(), true, nil
 }

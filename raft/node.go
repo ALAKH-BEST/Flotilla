@@ -54,13 +54,21 @@ type Node struct {
 	// Persistent state (saved to Storage before replying to any RPC that changes it).
 	currentTerm int
 	votedFor    int // -1 when the node has not voted this term
-	log         []Entry
+	// log[0] is a sentinel for the entry at snapshotIndex; log[i] is the entry at
+	// snapshotIndex+i. Entries up to snapshotIndex live only in the snapshot.
+	log           []Entry
+	snapshotIndex int
+	snapshotTerm  int
+	snapshot      []byte // never modified once set, so it can be shared with RPCs
 
 	// Volatile state.
 	commitIndex int
 	lastApplied int
 	role        Role
 	leaderID    int
+	// pendingSnapshot is a snapshot waiting to be handed to the state machine, which
+	// must happen before any entry that follows it.
+	pendingSnapshot *ApplyMsg
 
 	electionDeadline time.Time
 	nextHeartbeat    time.Time
@@ -133,6 +141,19 @@ func New(cfg Config) (*Node, error) {
 		n.currentTerm = state.CurrentTerm
 		n.votedFor = state.VotedFor
 		n.log = state.Log
+		n.snapshotIndex = state.SnapshotIndex
+		n.snapshotTerm = state.SnapshotTerm
+		n.snapshot = state.Snapshot
+		if len(n.log) == 0 {
+			n.log = []Entry{{Term: n.snapshotTerm}}
+		}
+		// Everything up to the snapshot is already committed. The state machine starts
+		// empty, so the snapshot is handed to it first.
+		n.commitIndex = n.snapshotIndex
+		n.lastApplied = n.snapshotIndex
+		if n.snapshotIndex > 0 {
+			n.pendingSnapshot = n.snapshotMsg()
+		}
 	}
 	return n, nil
 }
@@ -190,7 +211,32 @@ func (n *Node) Status() Status {
 		LeaderID:     n.leaderID,
 		CommitIndex:  n.commitIndex,
 		LastLogIndex: n.lastLogIndex(),
+
+		SnapshotIndex: n.snapshotIndex,
+		LogEntries:    len(n.log) - 1,
 	}
+}
+
+// Snapshot tells the node that the state machine has applied everything up to index
+// and can summarize it as data. The node drops the log up to index and keeps data
+// to bring slow followers and restarted nodes up to date. Calls for an index that is
+// already covered are ignored; an index that is not yet committed is an error.
+func (n *Node) Snapshot(index int, data []byte) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stopped || index <= n.snapshotIndex {
+		return nil
+	}
+	if index > n.commitIndex {
+		return fmt.Errorf("raft: cannot snapshot index %d: only %d is committed", index, n.commitIndex)
+	}
+	term := n.termAt(index)
+	n.log = append([]Entry{{Term: term}}, n.log[index-n.snapshotIndex+1:]...)
+	n.snapshotIndex = index
+	n.snapshotTerm = term
+	n.snapshot = append([]byte(nil), data...)
+	n.persist()
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -228,22 +274,36 @@ func (n *Node) tick(now time.Time) {
 	}
 }
 
-// applier delivers committed entries to ApplyCh, in order, outside the lock.
+// applier delivers snapshots and committed entries to ApplyCh, in order, outside the lock.
 func (n *Node) applier() {
 	defer n.wg.Done()
 	n.mu.Lock()
 	for {
-		for !n.stopped && n.lastApplied >= n.commitIndex {
+		for !n.stopped && n.pendingSnapshot == nil && n.lastApplied >= n.commitIndex {
 			n.applyCond.Wait()
 		}
 		if n.stopped {
 			n.mu.Unlock()
 			return
 		}
+		if snap := n.pendingSnapshot; snap != nil {
+			n.pendingSnapshot = nil
+			n.mu.Unlock()
+			select {
+			case n.cfg.ApplyCh <- *snap:
+			case <-n.stopCh:
+				return
+			}
+			n.mu.Lock()
+			continue
+		}
 		first, last := n.lastApplied+1, n.commitIndex
-		msgs := make([]ApplyMsg, 0, last-first+1)
+		if first <= n.snapshotIndex {
+			first = n.snapshotIndex + 1 // the state machine already has these through its own snapshot
+		}
+		msgs := make([]ApplyMsg, 0, max(0, last-first+1))
 		for i := first; i <= last; i++ {
-			e := n.log[i]
+			e := n.log[i-n.snapshotIndex]
 			msgs = append(msgs, ApplyMsg{Index: i, Term: e.Term, Command: e.Command, NoOp: e.NoOp})
 		}
 		n.mu.Unlock()
@@ -255,15 +315,35 @@ func (n *Node) applier() {
 			}
 		}
 		n.mu.Lock()
-		n.lastApplied = last
+		if n.lastApplied < last { // a snapshot installed meanwhile may have moved it further
+			n.lastApplied = last
+		}
 	}
 }
 
 // ---------------------------------------------------------------------------
 // Helpers (the lock must be held)
 
-func (n *Node) lastLogIndex() int { return len(n.log) - 1 }
+func (n *Node) lastLogIndex() int { return n.snapshotIndex + len(n.log) - 1 }
 func (n *Node) lastLogTerm() int  { return n.log[len(n.log)-1].Term }
+
+// termAt returns the term of the entry at index, which must lie between
+// snapshotIndex and lastLogIndex.
+func (n *Node) termAt(index int) int { return n.log[index-n.snapshotIndex].Term }
+
+// entriesFrom returns a copy of the entries from index to the end of the log.
+func (n *Node) entriesFrom(index int) []Entry {
+	return append([]Entry(nil), n.log[index-n.snapshotIndex:]...)
+}
+
+func (n *Node) snapshotMsg() *ApplyMsg {
+	return &ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      n.snapshot,
+		SnapshotIndex: n.snapshotIndex,
+		SnapshotTerm:  n.snapshotTerm,
+	}
+}
 
 func (n *Node) resetElectionDeadline() {
 	span := n.cfg.ElectionTimeoutMax - n.cfg.ElectionTimeoutMin
@@ -275,9 +355,12 @@ func (n *Node) resetElectionDeadline() {
 // so it stops rather than carry on.
 func (n *Node) persist() {
 	err := n.cfg.Storage.Save(State{
-		CurrentTerm: n.currentTerm,
-		VotedFor:    n.votedFor,
-		Log:         append([]Entry(nil), n.log...),
+		CurrentTerm:   n.currentTerm,
+		VotedFor:      n.votedFor,
+		Log:           append([]Entry(nil), n.log...),
+		SnapshotIndex: n.snapshotIndex,
+		SnapshotTerm:  n.snapshotTerm,
+		Snapshot:      n.snapshot,
 	})
 	if err != nil {
 		panic(fmt.Sprintf("raft: node %d cannot persist state: %v", n.cfg.ID, err))

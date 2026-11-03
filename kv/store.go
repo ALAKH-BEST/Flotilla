@@ -47,6 +47,11 @@ func NewStore() *Store { return &Store{data: make(map[string]string)} }
 func (s *Store) Apply(msg raft.ApplyMsg) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if msg.SnapshotValid {
+		s.restore(msg.Snapshot)
+		s.lastApplied = msg.SnapshotIndex
+		return
+	}
 	s.lastApplied = msg.Index
 	if msg.NoOp {
 		return
@@ -61,6 +66,40 @@ func (s *Store) Apply(msg raft.ApplyMsg) {
 	case OpDelete:
 		delete(s.data, c.Key)
 	}
+}
+
+// Snapshot serializes the store's data. The output is deterministic, so replicas
+// that applied the same log produce identical bytes.
+func (s *Store) Snapshot() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	b, err := json.Marshal(s.data) // map keys are sorted
+	if err != nil {
+		panic(err) // a map of strings always marshals
+	}
+	return b
+}
+
+// restore replaces the data with a snapshot (the lock must be held).
+func (s *Store) restore(snapshot []byte) {
+	data := make(map[string]string)
+	if len(snapshot) > 0 {
+		if err := json.Unmarshal(snapshot, &data); err != nil {
+			return // a snapshot written by Snapshot always parses; keep the old data otherwise
+		}
+	}
+	s.data = data
+}
+
+// Data returns a copy of all key-value pairs, for comparing replicas.
+func (s *Store) Data() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]string, len(s.data))
+	for k, v := range s.data {
+		out[k] = v
+	}
+	return out
 }
 
 // Get returns the value for a key from this replica's applied state. It is not a
