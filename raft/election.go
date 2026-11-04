@@ -65,6 +65,7 @@ func (n *Node) becomeLeader() {
 	for _, peer := range n.cfg.Peers {
 		n.nextIndex[peer] = last // the no-op is the first entry to send
 		n.matchIndex[peer] = 0
+		n.ackSeq[peer] = 0
 	}
 	n.matchIndex[n.cfg.ID] = last
 	n.nextHeartbeat = time.Now().Add(n.cfg.HeartbeatInterval)

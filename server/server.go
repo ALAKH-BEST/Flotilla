@@ -1,7 +1,9 @@
 // Package server turns a Raft node and a key-value store into a service that clients can
-// call. Every request, reads included, goes through the replicated log, so a request
-// that returns took effect at one point between its start and its end (linearizable),
-// and a retried request is not run twice.
+// call. Writes go through the replicated log, so a request that returns took effect at one
+// point between its start and its end (linearizable), and a retried write is not run twice.
+// Reads use Raft's read index: the leader confirms it is still the leader with a round of
+// heartbeats, waits for its state machine to catch up to its commit index, and answers from
+// local state. That is also linearizable, and writes nothing to disk.
 package server
 
 import (
@@ -34,11 +36,19 @@ type Config struct {
 	SnapshotEvery int
 	// RequestTimeout bounds how long Do waits for a commit. Zero means 2 seconds.
 	RequestTimeout time.Duration
+	// LogReads sends gets through the replicated log like writes instead of using the read
+	// index. It is slower and exists for comparison and testing.
+	LogReads bool
 }
 
 type outcome struct {
 	result kv.Result
 	err    error
+}
+
+type reader struct {
+	index int
+	ch    chan struct{} // closed when the state machine reaches index
 }
 
 type waiter struct {
@@ -53,9 +63,12 @@ type Server struct {
 	applyCh       chan raft.ApplyMsg
 	snapshotEvery int
 	timeout       time.Duration
+	logReads      bool
 
 	mu      sync.Mutex
 	waiters map[int]*waiter // requests waiting for their log index to commit
+	applied int             // the newest index the state machine has applied
+	readers []*reader       // reads waiting for the state machine to reach an index
 
 	stopCh   chan struct{}
 	stopOnce sync.Once
@@ -82,6 +95,7 @@ func New(cfg Config) (*Server, error) {
 		applyCh:       applyCh,
 		snapshotEvery: cfg.SnapshotEvery,
 		timeout:       timeout,
+		logReads:      cfg.LogReads,
 		waiters:       make(map[int]*waiter),
 		stopCh:        make(chan struct{}),
 	}, nil
@@ -123,6 +137,14 @@ func (s *Server) HandleInstallSnapshot(args *raft.InstallSnapshotArgs) *raft.Ins
 
 // Do runs a command through the replicated log and returns its result.
 func (s *Server) Do(ctx context.Context, cmd kv.Command) (kv.Result, error) {
+	if cmd.Op == kv.OpGet && !s.logReads {
+		res, err := s.readLocal(ctx, cmd.Key)
+		if !errors.Is(err, raft.ErrNotReady) {
+			return res, err
+		}
+		// A leader that was just elected has not yet committed an entry of its own term, so
+		// its commit index may be stale. Read through the log until it has.
+	}
 	// The lock is held from Propose until the waiter is registered, so the apply loop
 	// cannot deliver the result before anyone is waiting for it.
 	s.mu.Lock()
@@ -162,6 +184,61 @@ func (s *Server) Do(ctx context.Context, cmd kv.Command) (kv.Result, error) {
 	}
 }
 
+// readLocal serves a get with the read index: the leader proves it is still the leader, the
+// state machine catches up to the commit index the leader had at that point, and the key is read locally.
+func (s *Server) readLocal(ctx context.Context, key string) (kv.Result, error) {
+	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+	fail := func(err error) (kv.Result, error) {
+		switch {
+		case errors.Is(err, raft.ErrNotLeader):
+			return kv.Result{}, ErrNotLeader
+		case errors.Is(err, raft.ErrStopped):
+			return kv.Result{}, ErrStopped
+		case errors.Is(err, context.DeadlineExceeded):
+			return kv.Result{}, ErrTimeout
+		}
+		return kv.Result{}, err
+	}
+	index, err := s.node.ReadIndex(ctx)
+	if err != nil {
+		return fail(err)
+	}
+	if err := s.waitApplied(ctx, index); err != nil {
+		return fail(err)
+	}
+	v, ok := s.store.Get(key)
+	return kv.Result{Value: v, Found: ok}, nil
+}
+
+// waitApplied blocks until the state machine has applied up to index.
+func (s *Server) waitApplied(ctx context.Context, index int) error {
+	s.mu.Lock()
+	if s.applied >= index {
+		s.mu.Unlock()
+		return nil
+	}
+	r := &reader{index: index, ch: make(chan struct{})}
+	s.readers = append(s.readers, r)
+	s.mu.Unlock()
+	select {
+	case <-r.ch:
+		return nil
+	case <-ctx.Done():
+		s.mu.Lock()
+		for i, x := range s.readers {
+			if x == r {
+				s.readers = append(s.readers[:i], s.readers[i+1:]...)
+				break
+			}
+		}
+		s.mu.Unlock()
+		return ctx.Err()
+	case <-s.stopCh:
+		return raft.ErrStopped
+	}
+}
+
 func (s *Server) applyLoop() {
 	defer s.wg.Done()
 	for {
@@ -178,6 +255,20 @@ func (s *Server) handle(msg raft.ApplyMsg) {
 	result := s.store.Apply(msg)
 
 	s.mu.Lock()
+	if msg.SnapshotValid {
+		s.applied = msg.SnapshotIndex
+	} else {
+		s.applied = msg.Index
+	}
+	kept := s.readers[:0]
+	for _, r := range s.readers {
+		if r.index <= s.applied {
+			close(r.ch)
+		} else {
+			kept = append(kept, r)
+		}
+	}
+	s.readers = kept
 	if msg.SnapshotValid {
 		// The state jumped forward. We cannot tell whether a waiting request ran, so
 		// tell it to retry; the client's session makes the retry safe.

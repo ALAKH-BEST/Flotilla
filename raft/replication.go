@@ -23,6 +23,8 @@ func (n *Node) replicateTo(peer int) {
 		return
 	}
 	prev := next - 1
+	n.sendSeq++
+	seq := n.sendSeq
 	args := &AppendEntriesArgs{
 		Term:         n.currentTerm,
 		LeaderID:     n.cfg.ID,
@@ -48,6 +50,7 @@ func (n *Node) replicateTo(peer int) {
 		n.resetElectionDeadline()
 		return
 	}
+	n.acked(peer, seq) // any answer in our term shows the peer accepts us as leader
 	if reply.Success {
 		match := args.PrevLogIndex + len(args.Entries)
 		if match > n.matchIndex[peer] { // replies can arrive out of order
@@ -89,6 +92,8 @@ func (n *Node) replicateTo(peer int) {
 // sendSnapshot sends the snapshot to a follower that is behind it. It is called with
 // the lock held and releases it.
 func (n *Node) sendSnapshot(peer int) {
+	n.sendSeq++
+	seq := n.sendSeq
 	args := &InstallSnapshotArgs{
 		Term:              n.currentTerm,
 		LeaderID:          n.cfg.ID,
@@ -113,6 +118,7 @@ func (n *Node) sendSnapshot(peer int) {
 		n.resetElectionDeadline()
 		return
 	}
+	n.acked(peer, seq)
 	if args.LastIncludedIndex > n.matchIndex[peer] {
 		n.matchIndex[peer] = args.LastIncludedIndex
 	}

@@ -76,6 +76,11 @@ type Node struct {
 	// Leader state, reset on every election win.
 	nextIndex  map[int]int
 	matchIndex map[int]int
+	// sendSeq numbers the messages the leader sends; ackSeq is the newest one each peer answered
+	// in this term. Together they prove, for ReadIndex, that a majority still follows us.
+	sendSeq int
+	ackSeq  map[int]int
+	reads   []*readReq
 
 	started  bool
 	stopped  bool
@@ -129,6 +134,7 @@ func New(cfg Config) (*Node, error) {
 		leaderID:   -1,
 		nextIndex:  make(map[int]int),
 		matchIndex: make(map[int]int),
+		ackSeq:     make(map[int]int),
 		stopCh:     make(chan struct{}),
 	}
 	n.applyCond = sync.NewCond(&n.mu)
@@ -176,6 +182,7 @@ func (n *Node) Start() {
 func (n *Node) Stop() {
 	n.mu.Lock()
 	n.stopped = true
+	n.failReads(ErrStopped)
 	n.applyCond.Broadcast()
 	n.mu.Unlock()
 	n.stopOnce.Do(func() { close(n.stopCh) })
@@ -375,4 +382,5 @@ func (n *Node) becomeFollower(term int) {
 		n.persist()
 	}
 	n.role = Follower
+	n.failReads(ErrNotLeader)
 }

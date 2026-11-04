@@ -14,8 +14,9 @@ type Op string
 const (
 	OpPut    Op = "put"
 	OpDelete Op = "delete"
-	// OpGet goes through the log like a write, so it reads the state at a single
-	// point in the agreed order and the result is linearizable.
+	// OpGet reads a key. When it is submitted through the log it reads the state at a
+	// single point in the agreed order, which makes it linearizable; the server can also
+	// serve it without a log entry (see Store.Get).
 	OpGet Op = "get"
 )
 
@@ -151,8 +152,9 @@ func (s *Store) Data() map[string]string {
 	return out
 }
 
-// Get returns the value for a key from this replica's applied state. It is not a
-// linearizable read: a replica can lag behind the leader.
+// Get returns the value for a key from this replica's applied state, without going through
+// the log. On its own it is not a linearizable read, because a replica can lag behind the
+// leader; the server uses it only after the read index has confirmed the replica is current.
 func (s *Store) Get(key string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

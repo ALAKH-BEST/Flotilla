@@ -267,3 +267,87 @@ func TestIsolatedLeaderCannotServeStaleRead(t *testing.T) {
 		t.Fatalf("after healing, get = %q, %v; want new", v, err)
 	}
 }
+
+func (c *kvCluster) leader(t *testing.T) int {
+	t.Helper()
+	limit := time.Now().Add(10 * time.Second)
+	for time.Now().Before(limit) {
+		for i := range c.servers {
+			c.mu.Lock()
+			srv := c.servers[i]
+			c.mu.Unlock()
+			if srv != nil && srv.Node().Status().Role == raft.Leader {
+				return i
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("no leader")
+	return -1
+}
+
+// Reads are served from the leader's state machine and add nothing to the log, so they cost
+// no disk write. Writes still do.
+func TestReadsDoNotGrowTheLog(t *testing.T) {
+	c := newKVCluster(t, 3, 0)
+	deadline := ctx(t, 30*time.Second)
+	cl := c.clerk(1)
+	if err := cl.Put(deadline, "k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	node := c.servers[c.leader(t)].Node()
+	before := node.Status().LastLogIndex
+	for i := 0; i < 50; i++ {
+		v, found, err := cl.Get(deadline, "k")
+		if err != nil || !found || v != "v" {
+			t.Fatalf("get = %q, %v, %v", v, found, err)
+		}
+	}
+	if after := node.Status().LastLogIndex; after != before {
+		t.Fatalf("50 reads grew the log from %d to %d entries", before, after)
+	}
+	if err := cl.Put(deadline, "k", "w"); err != nil {
+		t.Fatal(err)
+	}
+	if after := node.Status().LastLogIndex; after != before+1 {
+		t.Fatalf("a write should add one entry: %d -> %d", before, after)
+	}
+}
+
+// A read always sees the writes that finished before it started, including right after a
+// leader change when the new leader has to catch its state machine up first.
+func TestReadSeesCompletedWritesAcrossLeaderChanges(t *testing.T) {
+	const servers = 5
+	c := newKVCluster(t, servers, 0)
+	deadline := ctx(t, 60*time.Second)
+	cl := c.clerk(1)
+	for round := 0; round < 4; round++ {
+		want := fmt.Sprintf("v%d", round)
+		if err := cl.Put(deadline, "x", want); err != nil {
+			t.Fatal(err)
+		}
+		if got, _, err := cl.Get(deadline, "x"); err != nil || got != want {
+			t.Fatalf("round %d: get = %q, %v; want %q", round, got, err, want)
+		}
+		c.net.Isolate(c.leader(t)) // force an election, then read from the new leader
+		if got, _, err := c.clerk(int64(10+round)).Get(deadline, "x"); err != nil || got != want {
+			t.Fatalf("round %d after the leader change: get = %q, %v; want %q", round, got, err, want)
+		}
+		c.net.Heal()
+	}
+}
+
+// Only the leader answers a read.
+func TestFollowerRefusesRead(t *testing.T) {
+	c := newKVCluster(t, 3, 0)
+	deadline := ctx(t, 30*time.Second)
+	if err := c.clerk(1).Put(deadline, "k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	leader := c.leader(t)
+	follower := (leader + 1) % 3
+	_, err := liveDoer{c: c, i: follower}.Do(deadline, kv.Command{Op: kv.OpGet, Key: "k"})
+	if err != server.ErrNotLeader {
+		t.Fatalf("a follower's answer to a read was %v, want ErrNotLeader", err)
+	}
+}

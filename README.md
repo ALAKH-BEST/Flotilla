@@ -63,7 +63,9 @@ clerk.Put(ctx, "x", "1")
 value, found, err := clerk.Get(ctx, "x")
 ```
 
-Every request, reads included, goes through the replicated log, so a request that returns took effect at one point between its start and its end. A client retries with the same sequence number, and the store remembers each client's latest request, so a retry after a timeout or leader change does not run twice. Serving reads through the log is simple and safe but costs a round of replication per read.
+Writes go through the replicated log, so a request that returns took effect at one point between its start and its end. A client retries with the same sequence number, and the store remembers each client's latest request, so a retry after a timeout or leader change does not run twice.
+
+Reads use Raft's read index, so they write nothing to the log or the disk. The leader notes its commit index, confirms with one round of heartbeats that a majority still accepts it as leader, waits for its state machine to reach that index, then answers from local state. Right after an election, before the new leader has committed an entry of its own term, reads fall back to the log. `Config.LogReads` forces the old behaviour of sending reads through the log.
 
 ## Run a cluster
 
@@ -109,7 +111,7 @@ The cluster tests run real nodes over `simnet` and check these cases:
 - nodes restore their state machine from the snapshot after a restart
 - snapshots together with message loss and delay
 
-The server tests run five servers with clients hammering them while a nemesis isolates nodes, splits the cluster 2 / 3 and crashes and restarts nodes. Every operation is recorded and the checker in `linearize/` verifies the whole history is linearizable. A targeted test also checks that a leader cut off from the majority refuses reads instead of answering from stale data, and that a duplicated request runs once. I checked that these tests fail when each guarantee is deliberately broken.
+The server tests run five servers with clients hammering them while a nemesis isolates nodes, splits the cluster 2 / 3 and crashes and restarts nodes. Every operation is recorded and the checker in `linearize/` verifies the whole history is linearizable. Targeted tests check that a leader cut off from the majority refuses reads instead of answering from stale data, that reads add nothing to the log, that a new leader refuses a read index until it has committed in its term, that a read waits for the state machine to catch up, and that a duplicated request runs once. I checked that these tests fail when each guarantee is deliberately broken.
 
 Every applied entry is also compared across replicas, and the test fails if two nodes ever disagree at the same index.
 
@@ -124,5 +126,4 @@ Every applied entry is also compared across replicas, and the test fails if two 
 
 ## Roadmap
 
-- Cheaper linearizable reads (a read index instead of a log entry per read)
 - Cluster membership changes
