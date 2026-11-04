@@ -6,7 +6,7 @@ Raft keeps a cluster of nodes agreeing on one ordered log even when nodes crash 
 
 ## Status
 
-Working: leader election, log replication, persistence across restarts, snapshots with log compaction, a key-value state machine, and a client API with exactly-once writes and linearizable reads, checked against recorded histories. Not done yet: cluster membership changes and a real network transport (see the roadmap).
+Working: leader election, log replication, persistence across restarts, snapshots with log compaction, a key-value state machine, and a client API with exactly-once writes and linearizable reads, checked against recorded histories. It runs as real processes over TCP with an HTTP API and on-disk state. Not done yet: cluster membership changes (see the roadmap).
 
 ## Layout
 
@@ -16,6 +16,9 @@ simnet/     in-memory network with drops, delays, isolation and partitions
 kv/         key-value state machine: puts, gets, deletes, exactly-once client sessions, snapshots
 server/     service on top of a Raft node, plus a client (Clerk) that finds the leader and retries
 linearize/  checker that decides whether a recorded history of operations is linearizable
+transport/tcp/   Raft RPCs over TCP (net/rpc with gob), with timeouts and reconnects
+internal/runner/ starts one node: TCP transport, on-disk storage, HTTP API
+cmd/flotilla/    the command-line server and client
 ```
 
 ```mermaid
@@ -62,6 +65,30 @@ value, found, err := clerk.Get(ctx, "x")
 
 Every request, reads included, goes through the replicated log, so a request that returns took effect at one point between its start and its end. A client retries with the same sequence number, and the store remembers each client's latest request, so a retry after a timeout or leader change does not run twice. Serving reads through the log is simple and safe but costs a round of replication per read.
 
+## Run a cluster
+
+Build it, then start three nodes, each in its own terminal (`-cluster` lists `id=raftAddr/httpAddr` for every node):
+
+```
+go build -o flotilla ./cmd/flotilla
+C=0=127.0.0.1:7000/127.0.0.1:8000,1=127.0.0.1:7001/127.0.0.1:8001,2=127.0.0.1:7002/127.0.0.1:8002
+./flotilla server -id 0 -cluster $C -data data0
+./flotilla server -id 1 -cluster $C -data data1
+./flotilla server -id 2 -cluster $C -data data2
+```
+
+Talk to any node; followers redirect writes to the leader, and a list of servers lets the client fall back when one is down:
+
+```
+./flotilla put -server 127.0.0.1:8000,127.0.0.1:8001 city Paris
+./flotilla get -server 127.0.0.1:8001 city
+./flotilla status -server 127.0.0.1:8002
+```
+
+Stop the leader with Ctrl-C and the others elect a new one and keep serving. Start it again with the same `-data` directory and it rejoins and catches up. Without `-data`, state is kept in memory only.
+
+The HTTP API is `GET|PUT|DELETE /kv/{key}` and `GET /status`.
+
 ## Tests
 
 ```sh
@@ -98,5 +125,4 @@ Every applied entry is also compared across replicas, and the test fails if two 
 ## Roadmap
 
 - Cheaper linearizable reads (a read index instead of a log entry per read)
-- A TCP transport and a runnable server
 - Cluster membership changes
