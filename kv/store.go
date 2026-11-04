@@ -14,13 +14,37 @@ type Op string
 const (
 	OpPut    Op = "put"
 	OpDelete Op = "delete"
+	// OpGet goes through the log like a write, so it reads the state at a single
+	// point in the agreed order and the result is linearizable.
+	OpGet Op = "get"
 )
 
-// Command is what a client submits through Raft.
+// Command is what a client submits through Raft. A command with a ClientID is applied
+// at most once: the store remembers each client's latest Seq and its result, so a
+// request that is retried after a timeout or a leader change does not run twice.
+// A client must use increasing Seq values and have one request in flight at a time.
 type Command struct {
-	Op    Op     `json:"op"`
-	Key   string `json:"key"`
+	Op       Op     `json:"op"`
+	Key      string `json:"key"`
+	Value    string `json:"value,omitempty"`
+	ClientID int64  `json:"client,omitempty"`
+	Seq      int64  `json:"seq,omitempty"`
+}
+
+// Result is what a command returns. For a get, Value and Found describe the key.
+type Result struct {
 	Value string `json:"value,omitempty"`
+	Found bool   `json:"found,omitempty"`
+}
+
+type session struct {
+	Seq    int64  `json:"seq"`
+	Result Result `json:"result"`
+}
+
+type snapshotData struct {
+	Data     map[string]string `json:"data"`
+	Sessions map[int64]session `json:"sessions"`
 }
 
 // Encode turns a command into the bytes stored in the Raft log.
@@ -37,58 +61,83 @@ func Encode(c Command) []byte {
 type Store struct {
 	mu          sync.RWMutex
 	data        map[string]string
+	sessions    map[int64]session // latest request of each client, for exactly-once execution
 	lastApplied int
 }
 
-func NewStore() *Store { return &Store{data: make(map[string]string)} }
+func NewStore() *Store {
+	return &Store{data: make(map[string]string), sessions: make(map[int64]session)}
+}
 
-// Apply applies one committed entry. No-op entries and malformed commands are skipped,
-// but every entry still advances the applied index.
-func (s *Store) Apply(msg raft.ApplyMsg) {
+// Apply applies one committed entry and returns its result. No-op entries and malformed
+// commands are skipped, but every entry still advances the applied index. A snapshot
+// replaces the whole state.
+func (s *Store) Apply(msg raft.ApplyMsg) Result {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if msg.SnapshotValid {
 		s.restore(msg.Snapshot)
 		s.lastApplied = msg.SnapshotIndex
-		return
+		return Result{}
 	}
 	s.lastApplied = msg.Index
 	if msg.NoOp {
-		return
+		return Result{}
 	}
 	var c Command
 	if err := json.Unmarshal(msg.Command, &c); err != nil {
-		return
+		return Result{}
 	}
+	if c.ClientID != 0 {
+		if prev, ok := s.sessions[c.ClientID]; ok && c.Seq <= prev.Seq {
+			if c.Seq == prev.Seq {
+				return prev.Result // a retry of the latest request: answer again, do not rerun it
+			}
+			return Result{} // an old request that was already superseded
+		}
+	}
+	var res Result
 	switch c.Op {
 	case OpPut:
 		s.data[c.Key] = c.Value
 	case OpDelete:
 		delete(s.data, c.Key)
+	case OpGet:
+		res.Value, res.Found = s.data[c.Key]
 	}
+	if c.ClientID != 0 {
+		s.sessions[c.ClientID] = session{Seq: c.Seq, Result: res}
+	}
+	return res
 }
 
-// Snapshot serializes the store's data. The output is deterministic, so replicas
-// that applied the same log produce identical bytes.
+// Snapshot serializes the store's data and client sessions. The output is deterministic,
+// so replicas that applied the same log produce identical bytes.
 func (s *Store) Snapshot() []byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	b, err := json.Marshal(s.data) // map keys are sorted
+	b, err := json.Marshal(snapshotData{Data: s.data, Sessions: s.sessions}) // map keys are sorted
 	if err != nil {
-		panic(err) // a map of strings always marshals
+		panic(err) // plain strings and numbers always marshal
 	}
 	return b
 }
 
 // restore replaces the data with a snapshot (the lock must be held).
 func (s *Store) restore(snapshot []byte) {
-	data := make(map[string]string)
+	var snap snapshotData
 	if len(snapshot) > 0 {
-		if err := json.Unmarshal(snapshot, &data); err != nil {
-			return // a snapshot written by Snapshot always parses; keep the old data otherwise
+		if err := json.Unmarshal(snapshot, &snap); err != nil {
+			return // a snapshot written by Snapshot always parses; keep the old state otherwise
 		}
 	}
-	s.data = data
+	if snap.Data == nil {
+		snap.Data = make(map[string]string)
+	}
+	if snap.Sessions == nil {
+		snap.Sessions = make(map[int64]session)
+	}
+	s.data, s.sessions = snap.Data, snap.Sessions
 }
 
 // Data returns a copy of all key-value pairs, for comparing replicas.

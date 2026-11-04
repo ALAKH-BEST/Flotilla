@@ -6,14 +6,16 @@ Raft keeps a cluster of nodes agreeing on one ordered log even when nodes crash 
 
 ## Status
 
-Working: leader election, log replication, persistence across restarts, snapshots with log compaction, and a key-value state machine. Not done yet: cluster membership changes, a real network transport and a linearizable client API (see the roadmap).
+Working: leader election, log replication, persistence across restarts, snapshots with log compaction, a key-value state machine, and a client API with exactly-once writes and linearizable reads, checked against recorded histories. Not done yet: cluster membership changes and a real network transport (see the roadmap).
 
 ## Layout
 
 ```
-raft/     the algorithm: election, replication, persistence hooks, Node API
-simnet/   in-memory network with drops, delays, isolation and partitions
-kv/       key-value state machine that applies committed entries and snapshots its data
+raft/       the algorithm: election, replication, snapshots, persistence hooks, Node API
+simnet/     in-memory network with drops, delays, isolation and partitions
+kv/         key-value state machine: puts, gets, deletes, exactly-once client sessions, snapshots
+server/     service on top of a Raft node, plus a client (Clerk) that finds the leader and retries
+linearize/  checker that decides whether a recorded history of operations is linearizable
 ```
 
 ```mermaid
@@ -50,6 +52,16 @@ err := node.Snapshot(index, stateMachine.Snapshot())
 
 A snapshot reaches the state machine on `ApplyCh` as an `ApplyMsg` with `SnapshotValid` set, after a restart or when the node fell too far behind. It replaces the state machine's whole state.
 
+### Client API
+
+```go
+clerk := server.NewClerk(1, servers) // a unique non-zero client ID
+clerk.Put(ctx, "x", "1")
+value, found, err := clerk.Get(ctx, "x")
+```
+
+Every request, reads included, goes through the replicated log, so a request that returns took effect at one point between its start and its end. A client retries with the same sequence number, and the store remembers each client's latest request, so a retry after a timeout or leader change does not run twice. Serving reads through the log is simple and safe but costs a round of replication per read.
+
 ## Tests
 
 ```sh
@@ -70,6 +82,8 @@ The cluster tests run real nodes over `simnet` and check these cases:
 - nodes restore their state machine from the snapshot after a restart
 - snapshots together with message loss and delay
 
+The server tests run five servers with clients hammering them while a nemesis isolates nodes, splits the cluster 2 / 3 and crashes and restarts nodes. Every operation is recorded and the checker in `linearize/` verifies the whole history is linearizable. A targeted test also checks that a leader cut off from the majority refuses reads instead of answering from stale data, and that a duplicated request runs once. I checked that these tests fail when each guarantee is deliberately broken.
+
 Every applied entry is also compared across replicas, and the test fails if two nodes ever disagree at the same index.
 
 ## Design notes
@@ -83,7 +97,6 @@ Every applied entry is also compared across replicas, and the test fails if two 
 
 ## Roadmap
 
-- A linearizable client API (request deduplication, reads through the leader)
-- Linearizability checking of recorded histories
+- Cheaper linearizable reads (a read index instead of a log entry per read)
 - A TCP transport and a runnable server
 - Cluster membership changes
