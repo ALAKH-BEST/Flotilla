@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 var (
@@ -83,6 +84,7 @@ func (n *Node) acked(peer, seq int) {
 	if seq > n.ackSeq[peer] {
 		n.ackSeq[peer] = seq
 	}
+	n.lastContact[peer] = time.Now()
 	kept := n.reads[:0]
 	for _, r := range n.reads {
 		if n.confirmed(r.seq) {
@@ -111,4 +113,16 @@ func (n *Node) dropRead(req *readReq) {
 			return
 		}
 	}
+}
+
+// hasQuorumContact reports whether a majority of the voters, this node included, has answered
+// within the last election timeout (the lock must be held).
+func (n *Node) hasQuorumContact(now time.Time) bool {
+	count := 0
+	for _, m := range n.voters() {
+		if m.ID == n.cfg.ID || now.Sub(n.lastContact[m.ID]) <= n.cfg.ElectionTimeoutMax {
+			count++
+		}
+	}
+	return n.isMajority(count)
 }

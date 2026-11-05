@@ -424,3 +424,59 @@ func TestLastVoterCannotBeRemovedEvenWithALearner(t *testing.T) {
 		t.Fatalf("removing the only voter: %v, want ErrLastMember", err)
 	}
 }
+
+// A leader that cannot reach a majority stops claiming to be leader, so clients are not left
+// waiting on a leader that can neither commit nor confirm a read.
+func TestIsolatedLeaderStepsDown(t *testing.T) {
+	c := newMemberCluster(t, 3, 3, 0)
+	old := c.checkOneLeader()
+	c.put("k", "v", 3)
+
+	c.isolate(old)
+	deadline := time.Now().Add(3 * time.Second)
+	for c.nodes[old].Status().Role == raft.Leader {
+		if time.Now().After(deadline) {
+			t.Fatal("a leader cut off from every other node never stepped down")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := c.nodes[old].Status().LeaderID; got == old {
+		t.Fatalf("the node that stepped down still names itself as leader")
+	}
+	c.put("k2", "v2", 2) // the other two elect a new leader and carry on
+	c.reconnect(old)
+	c.checkOneLeader()
+	c.waitStoresEqual()
+}
+
+// Losing one follower out of three leaves a majority, so the leader must keep leading, in the same term.
+func TestLeaderKeepsLeadingWhileAMajorityAnswers(t *testing.T) {
+	c := newMemberCluster(t, 3, 3, 0)
+	leader := c.checkOneLeader()
+	c.put("k", "v", 3)
+	term := c.nodes[leader].Status().Term
+
+	c.isolate((leader + 1) % 3)
+	for i := 0; i < 10; i++ {
+		time.Sleep(200 * time.Millisecond)
+		if st := c.nodes[leader].Status(); st.Role != raft.Leader || st.Term != term {
+			t.Fatalf("the leader gave up with a majority still answering: %+v (term was %d)", st, term)
+		}
+	}
+	c.put("k2", "v2", 2)
+}
+
+// Round trips slower than the tick interval are normal, so a freshly elected leader must be given
+// time to hear back from a majority before it is judged.
+func TestNewLeaderIsGivenTimeToHearFromAMajority(t *testing.T) {
+	c := newMemberCluster(t, 3, 3, 0)
+	c.net.SetDelay(25*time.Millisecond, 40*time.Millisecond)
+	leader := c.checkOneLeader()
+	term := c.nodes[leader].Status().Term
+	for i := 0; i < 8; i++ {
+		time.Sleep(200 * time.Millisecond)
+		if st := c.nodes[leader].Status(); st.Role != raft.Leader || st.Term != term {
+			t.Fatalf("the leader was unseated on a slow but healthy network: %+v (term was %d)", st, term)
+		}
+	}
+}

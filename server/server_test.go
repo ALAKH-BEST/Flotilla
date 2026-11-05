@@ -359,3 +359,28 @@ func hammer(t *testing.T, c *kvCluster, clients int, keys []string, runFor time.
 	wg.Wait()
 	return history
 }
+
+// A leader cut off from the cluster answers "not leader" so clients move on, instead of making
+// each of them wait out a timeout.
+func TestIsolatedLeaderRefusesClientsPromptly(t *testing.T) {
+	c := newKVCluster(t, 3, 0)
+	deadline := ctx(t, 30*time.Second)
+	if err := c.clerk(1).Put(deadline, "k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	leader := c.leader(t)
+	c.net.Isolate(leader)
+
+	limit := time.Now().Add(3 * time.Second)
+	for {
+		rctx, cancel := context.WithTimeout(deadline, 500*time.Millisecond)
+		_, err := liveDoer{c: c, i: leader}.Do(rctx, kv.Command{Op: kv.OpGet, Key: "k"})
+		cancel()
+		if err == server.ErrNotLeader {
+			return
+		}
+		if time.Now().After(limit) {
+			t.Fatalf("the isolated leader still did not answer ErrNotLeader after 3s; last error: %v", err)
+		}
+	}
+}

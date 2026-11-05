@@ -94,6 +94,9 @@ type Node struct {
 	sendSeq int
 	ackSeq  map[int]int
 	reads   []*readReq
+	// lastContact is when each peer last answered the leader in its term. A leader that cannot
+	// reach a majority steps down instead of staying leader in name only.
+	lastContact map[int]time.Time
 
 	started  bool
 	stopped  bool
@@ -158,6 +161,8 @@ func New(cfg Config) (*Node, error) {
 		nextIndex:  make(map[int]int),
 		matchIndex: make(map[int]int),
 		ackSeq:     make(map[int]int),
+
+		lastContact: make(map[int]time.Time),
 
 		snapshotMembers: bootstrap,
 		stopCh:          make(chan struct{}),
@@ -306,6 +311,13 @@ func (n *Node) tick(now time.Time) {
 		return
 	}
 	if n.role == Leader {
+		if !n.hasQuorumContact(now) {
+			// Cut off from a majority: this node cannot commit anything and may already have been
+			// replaced. Stepping down lets clients move on to a leader that can answer.
+			n.becomeFollower(n.currentTerm)
+			n.resetElectionDeadline()
+			return
+		}
 		if !now.Before(n.nextHeartbeat) {
 			n.nextHeartbeat = now.Add(n.cfg.HeartbeatInterval)
 			n.broadcastAppendEntries()
@@ -425,5 +437,8 @@ func (n *Node) becomeFollower(term int) {
 		n.persist()
 	}
 	n.role = Follower
+	if n.leaderID == n.cfg.ID {
+		n.leaderID = -1 // a node that stopped leading must not keep naming itself leader
+	}
 	n.failReads(ErrNotLeader)
 }

@@ -68,6 +68,7 @@ func (n *Node) becomeLeader() {
 		n.nextIndex[m.ID] = last // the no-op is the first entry to send
 		n.matchIndex[m.ID] = 0
 		n.ackSeq[m.ID] = 0
+		n.lastContact[m.ID] = time.Now() // a new leader gets a full timeout to hear from a majority
 	}
 	n.matchIndex[n.cfg.ID] = last
 	n.nextHeartbeat = time.Now().Add(n.cfg.HeartbeatInterval)

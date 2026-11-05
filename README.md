@@ -127,6 +127,7 @@ The cluster tests run real nodes over `simnet` and check these cases:
 - a leader removes itself and the rest carry on
 - a second change is refused while one is uncommitted, and the last member cannot be removed
 - a membership entry that never committed is undone when its leader is replaced
+- a leader cut off from a majority steps down, a healthy one does not, and a new leader gets time to hear back on a slow network
 - a learner does not count towards a majority and never campaigns, and a learner can be promoted or removed
 - adding a server waits for the new node to catch up before promoting it
 - the membership survives log compaction, restarts, and a node that joins after the log was compacted past it
@@ -145,6 +146,10 @@ Every applied entry is also compared across replicas, and the test fails if two 
 - A snapshot, its index and term, and the log after it are saved in one write, so they cannot disagree after a crash.
 - A follower that is behind the leader's snapshot receives it in an `InstallSnapshot` RPC, keeps any entries after it that match, and passes it to the state machine before later entries. The snapshot travels in one message; very large ones would need chunking.
 
+### Check-quorum
+
+A leader records when each voter last answered it. If a majority of voters (itself included) has not answered within an election timeout, it steps down. Without this, a leader cut off from the cluster stays leader in name: it cannot commit or confirm a read, and every client that reaches it waits out a timeout. With it, such a node answers "not leader" and clients move on at once. A newly elected leader gets a full timeout to hear back first.
+
 ### Membership changes
 
 - One server is added or removed at a time (paper section 6, single-server changes). Any majority of the old membership overlaps any majority of the new one, so two leaders cannot be elected in the same term across a change.
@@ -158,4 +163,4 @@ Every applied entry is also compared across replicas, and the test fails if two 
 ## Not done
 
 - Chunked snapshot transfer, and removing a node that is unreachable when its removal is replicated.
-- Leader stepping down when it loses contact with a majority (it stays leader but cannot commit or serve reads).
+- Pre-vote. A node that was cut off keeps raising its term while it campaigns, and forces an extra election when it comes back.
