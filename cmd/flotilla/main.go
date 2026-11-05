@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -16,15 +17,21 @@ import (
 )
 
 const usage = `usage:
-  flotilla server -id N -cluster SPEC [-data DIR] [-snapshot-every N]
+  flotilla server -id N -cluster SPEC [-data DIR] [-snapshot-every N] [-join]
   flotilla get    [-server ADDRS] KEY
   flotilla put    [-server ADDRS] KEY VALUE
   flotilla delete [-server ADDRS] KEY
   flotilla status [-server ADDRS]
+  flotilla members [-server ADDRS]
+  flotilla add    [-server ADDRS] ID RAFT_ADDR/HTTP_ADDR
+  flotilla remove [-server ADDRS] ID
 
 SPEC is a comma-separated list of id=raftHost:port/httpHost:port, for example
   0=127.0.0.1:7000/127.0.0.1:8000,1=127.0.0.1:7001/127.0.0.1:8001,2=127.0.0.1:7002/127.0.0.1:8002
 ADDRS is a comma-separated list of HTTP addresses (default 127.0.0.1:8000).
+
+To grow a cluster, start the new node with -join (its own entry in -cluster gives its
+addresses), then run "flotilla add" with those addresses. "flotilla remove" takes a node out.
 `
 
 func main() {
@@ -37,7 +44,7 @@ func main() {
 	switch cmd {
 	case "server":
 		err = runServer(args)
-	case "get", "put", "delete", "status":
+	case "get", "put", "delete", "status", "members", "add", "remove":
 		err = runClient(cmd, args)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
@@ -57,13 +64,14 @@ func runServer(args []string) error {
 	spec := fs.String("cluster", "", "cluster members: id=raftAddr/httpAddr,...")
 	dataDir := fs.String("data", "", "directory for durable state (empty: memory only)")
 	snapEvery := fs.Int("snapshot-every", 1000, "take a snapshot every N applied entries")
+	join := fs.Bool("join", false, "start outside any cluster, to be added with \"flotilla add\"")
 	_ = fs.Parse(args)
 
 	cluster, err := runner.ParseCluster(*spec)
 	if err != nil {
 		return err
 	}
-	r, err := runner.Start(runner.Config{ID: *id, Cluster: cluster, DataDir: *dataDir, SnapshotEvery: *snapEvery})
+	r, err := runner.Start(runner.Config{ID: *id, Cluster: cluster, DataDir: *dataDir, SnapshotEvery: *snapEvery, Join: *join})
 	if err != nil {
 		return err
 	}
@@ -94,15 +102,27 @@ func runClient(cmd string, args []string) error {
 		method = http.MethodDelete
 	case "status":
 		method, want, path = http.MethodGet, 0, "/status"
+	case "members":
+		method, want, path = http.MethodGet, 0, "/admin/members"
+	case "add":
+		method, want = http.MethodPut, 2
+	case "remove":
+		method = http.MethodDelete
 	}
 	if len(rest) != want {
 		return fmt.Errorf("%s takes %d argument(s)\n\n%s", cmd, want, usage)
 	}
-	if cmd != "status" {
+	switch cmd {
+	case "get", "put", "delete":
 		path = "/kv/" + rest[0]
+	case "add", "remove":
+		if _, err := strconv.Atoi(rest[0]); err != nil {
+			return fmt.Errorf("the node ID must be a number, got %q", rest[0])
+		}
+		path = "/admin/members/" + rest[0]
 	}
-	if cmd == "put" {
-		body = rest[1]
+	if cmd == "put" || cmd == "add" {
+		body = rest[len(rest)-1]
 	}
 
 	client := &http.Client{Timeout: 5 * time.Second}

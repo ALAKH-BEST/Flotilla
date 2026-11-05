@@ -69,12 +69,12 @@ func (n *Node) ReadIndex(ctx context.Context) (int, error) {
 // (the lock must be held).
 func (n *Node) confirmed(seq int) bool {
 	count := 0
-	for _, peer := range n.cfg.Peers {
-		if peer == n.cfg.ID || n.ackSeq[peer] > seq {
+	for _, m := range n.members {
+		if m.ID == n.cfg.ID || n.ackSeq[m.ID] > seq {
 			count++
 		}
 	}
-	return count*2 > len(n.cfg.Peers)
+	return n.isMajority(count)
 }
 
 // acked records that a peer answered the message with this sequence number in our term, and

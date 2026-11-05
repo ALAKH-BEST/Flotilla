@@ -9,6 +9,17 @@ type Entry struct {
 	// NoOp marks the entry a new leader appends to commit entries from earlier terms.
 	// It occupies a log index but is not a client command.
 	NoOp bool
+	// Members, when not empty, makes this a membership entry: the cluster's voting members
+	// from this entry on. A node uses the newest such entry in its log as soon as it is
+	// appended, committed or not.
+	Members []Member
+}
+
+// Member is a voting member of the cluster. Addr is opaque to Raft; the transport and the
+// application use it to find the node, and it travels with the membership.
+type Member struct {
+	ID   int
+	Addr string
 }
 
 // ApplyMsg is delivered, in order, to the state machine. It is either a committed
@@ -64,6 +75,8 @@ type InstallSnapshotArgs struct {
 	LastIncludedTerm  int
 	// Data is the whole snapshot in one message. Large snapshots would need chunking.
 	Data []byte
+	// Members is the cluster membership as of LastIncludedIndex.
+	Members []Member
 }
 
 type InstallSnapshotReply struct {
@@ -104,4 +117,6 @@ type Status struct {
 	// LogEntries is how many entries it still holds in memory after that point.
 	SnapshotIndex int
 	LogEntries    int
+	// Members are the IDs of the voting members this node currently uses.
+	Members []int
 }

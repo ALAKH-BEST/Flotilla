@@ -145,13 +145,55 @@ func (s *Server) Do(ctx context.Context, cmd kv.Command) (kv.Result, error) {
 		// A leader that was just elected has not yet committed an entry of its own term, so
 		// its commit index may be stale. Read through the log until it has.
 	}
-	// The lock is held from Propose until the waiter is registered, so the apply loop
+	return s.submit(ctx, func() (int, int, error) {
+		index, term, isLeader := s.node.Propose(kv.Encode(cmd))
+		if !isLeader {
+			return 0, 0, ErrNotLeader
+		}
+		return index, term, nil
+	})
+}
+
+// AddServer adds a node to the cluster and returns once the change has committed. Start the new
+// node first (with raft.Config.Join) so it can receive the log. addr travels with the
+// membership, so every node learns where to reach the new one.
+func (s *Server) AddServer(ctx context.Context, id int, addr string) error {
+	_, err := s.submit(ctx, func() (int, int, error) {
+		index, term, err := s.node.AddServer(raft.Member{ID: id, Addr: addr})
+		return index, term, mapRaftErr(err)
+	})
+	return err
+}
+
+// RemoveServer removes a node from the cluster and returns once the change has committed. The
+// leader may remove itself; it then steps down.
+func (s *Server) RemoveServer(ctx context.Context, id int) error {
+	_, err := s.submit(ctx, func() (int, int, error) {
+		index, term, err := s.node.RemoveServer(id)
+		return index, term, mapRaftErr(err)
+	})
+	return err
+}
+
+func mapRaftErr(err error) error {
+	switch {
+	case errors.Is(err, raft.ErrNotLeader):
+		return ErrNotLeader
+	case errors.Is(err, raft.ErrStopped):
+		return ErrStopped
+	}
+	return err
+}
+
+// submit appends something to the log with propose and waits for it to commit and be applied.
+func (s *Server) submit(ctx context.Context, propose func() (index, term int, err error)) (kv.Result, error) {
+	// The lock is held from the proposal until the waiter is registered, so the apply loop
 	// cannot deliver the result before anyone is waiting for it.
 	s.mu.Lock()
-	index, term, isLeader := s.node.Propose(kv.Encode(cmd))
-	if !isLeader {
+	index, term, err := propose()
+	if err != nil {
 		s.mu.Unlock()
-		return kv.Result{}, ErrNotLeader
+		return kv.Result{}, err
 	}
 	w := &waiter{term: term, ch: make(chan outcome, 1)}
 	if old := s.waiters[index]; old != nil {

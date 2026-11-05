@@ -10,6 +10,17 @@ import (
 	"time"
 )
 
+type listener = net.Listener
+
+func mustRelisten(t *testing.T, addr string) net.Listener {
+	t.Helper()
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
 type testNode struct {
 	r        *Runner
 	raftAddr string

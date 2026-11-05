@@ -17,6 +17,8 @@ type kvCluster struct {
 	t         *testing.T
 	net       *simnet.Network
 	n         int
+	initial   int    // the first initial nodes form the starting cluster
+	joining   []bool // nodes started with Join, to be added later
 	snapEvery int
 	storages  []*raft.MemoryStorage
 
@@ -25,18 +27,29 @@ type kvCluster struct {
 }
 
 func newKVCluster(t *testing.T, n, snapEvery int) *kvCluster {
+	return newKVMemberCluster(t, n, n, snapEvery)
+}
+
+// newKVMemberCluster has room for total nodes and starts the first initial; the others can be
+// started later with joinStart and added with AddServer.
+func newKVMemberCluster(t *testing.T, initial, total, snapEvery int) *kvCluster {
 	t.Helper()
+	n := total
 	c := &kvCluster{
 		t:         t,
 		net:       simnet.New(7),
 		n:         n,
+		initial:   initial,
+		joining:   make([]bool, n),
 		snapEvery: snapEvery,
 		storages:  make([]*raft.MemoryStorage, n),
 		servers:   make([]*server.Server, n),
 	}
 	for i := 0; i < n; i++ {
 		c.storages[i] = raft.NewMemoryStorage()
-		c.start(i)
+		if i < initial {
+			c.start(i)
+		}
 	}
 	t.Cleanup(func() {
 		for i := 0; i < n; i++ {
@@ -47,14 +60,17 @@ func newKVCluster(t *testing.T, n, snapEvery int) *kvCluster {
 }
 
 func (c *kvCluster) start(i int) {
-	peers := make([]int, c.n)
-	for p := range peers {
-		peers[p] = p
+	var peers []int
+	if !c.joining[i] {
+		for p := 0; p < c.initial; p++ {
+			peers = append(peers, p)
+		}
 	}
 	srv, err := server.New(server.Config{
 		Raft: raft.Config{
 			ID:        i,
 			Peers:     peers,
+			Join:      c.joining[i],
 			Transport: c.net.Transport(i),
 			Storage:   c.storages[i],
 			Seed:      int64(i + 1),

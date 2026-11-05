@@ -17,9 +17,19 @@ import (
 
 // Config configures a Node.
 type Config struct {
-	// ID is this node's ID. Peers lists every node in the cluster, including this one.
-	ID    int
-	Peers []int
+	// ID is this node's ID. Peers (or Members, when the nodes have addresses) lists every
+	// node of a new cluster, including this one. They are only the starting membership:
+	// once a node has saved state, the membership recorded in its log and snapshot wins.
+	ID      int
+	Peers   []int
+	Members []Member
+	// Join starts a node that is not yet part of any cluster. It has no members, so it does
+	// not campaign, and learns the membership from the leader once it is added with AddServer.
+	Join bool
+	// OnMembership is called with the voting members whenever this node's view of them
+	// changes (and once at Start). It runs with the node's lock held, so it must be quick
+	// and must not call back into the node.
+	OnMembership func([]Member)
 
 	Transport Transport
 	Storage   Storage
@@ -60,6 +70,9 @@ type Node struct {
 	snapshotIndex int
 	snapshotTerm  int
 	snapshot      []byte // never modified once set, so it can be shared with RPCs
+	// snapshotMembers is the membership as of snapshotIndex; members is the one in use now.
+	snapshotMembers []Member
+	members         []Member
 
 	// Volatile state.
 	commitIndex int
@@ -97,14 +110,24 @@ func New(cfg Config) (*Node, error) {
 	if cfg.Transport == nil || cfg.Storage == nil || cfg.ApplyCh == nil {
 		return nil, errors.New("raft: Transport, Storage and ApplyCh are required")
 	}
-	self := false
-	for _, id := range cfg.Peers {
-		if id == cfg.ID {
-			self = true
+	var bootstrap []Member
+	if !cfg.Join {
+		bootstrap = cfg.Members
+		if len(bootstrap) == 0 {
+			for _, id := range cfg.Peers {
+				bootstrap = append(bootstrap, Member{ID: id})
+			}
 		}
-	}
-	if !self {
-		return nil, fmt.Errorf("raft: Peers must include the node's own ID %d", cfg.ID)
+		self := false
+		for _, m := range bootstrap {
+			if m.ID == cfg.ID {
+				self = true
+			}
+		}
+		if !self {
+			return nil, fmt.Errorf("raft: the starting members must include the node's own ID %d", cfg.ID)
+		}
+		bootstrap = sortedMembers(bootstrap)
 	}
 	if cfg.ElectionTimeoutMin == 0 {
 		cfg.ElectionTimeoutMin = defaultElectionTimeoutMin
@@ -135,7 +158,9 @@ func New(cfg Config) (*Node, error) {
 		nextIndex:  make(map[int]int),
 		matchIndex: make(map[int]int),
 		ackSeq:     make(map[int]int),
-		stopCh:     make(chan struct{}),
+
+		snapshotMembers: bootstrap,
+		stopCh:          make(chan struct{}),
 	}
 	n.applyCond = sync.NewCond(&n.mu)
 
@@ -150,6 +175,9 @@ func New(cfg Config) (*Node, error) {
 		n.snapshotIndex = state.SnapshotIndex
 		n.snapshotTerm = state.SnapshotTerm
 		n.snapshot = state.Snapshot
+		if len(state.SnapshotMembers) > 0 {
+			n.snapshotMembers = state.SnapshotMembers
+		}
 		if len(n.log) == 0 {
 			n.log = []Entry{{Term: n.snapshotTerm}}
 		}
@@ -161,6 +189,7 @@ func New(cfg Config) (*Node, error) {
 			n.pendingSnapshot = n.snapshotMsg()
 		}
 	}
+	n.members = n.membersAt(n.lastLogIndex())
 	return n, nil
 }
 
@@ -173,6 +202,9 @@ func (n *Node) Start() {
 	}
 	n.started = true
 	n.resetElectionDeadline()
+	if n.cfg.OnMembership != nil {
+		n.cfg.OnMembership(append([]Member(nil), n.members...))
+	}
 	n.wg.Add(2)
 	go n.run()
 	go n.applier()
@@ -221,6 +253,7 @@ func (n *Node) Status() Status {
 
 		SnapshotIndex: n.snapshotIndex,
 		LogEntries:    len(n.log) - 1,
+		Members:       n.memberIDs(),
 	}
 }
 
@@ -238,7 +271,9 @@ func (n *Node) Snapshot(index int, data []byte) error {
 		return fmt.Errorf("raft: cannot snapshot index %d: only %d is committed", index, n.commitIndex)
 	}
 	term := n.termAt(index)
+	members := n.membersAt(index) // before the log below index is dropped
 	n.log = append([]Entry{{Term: term}}, n.log[index-n.snapshotIndex+1:]...)
+	n.snapshotMembers = members
 	n.snapshotIndex = index
 	n.snapshotTerm = term
 	n.snapshot = append([]byte(nil), data...)
@@ -277,6 +312,10 @@ func (n *Node) tick(now time.Time) {
 		return
 	}
 	if !now.Before(n.electionDeadline) {
+		if !n.isMember(n.cfg.ID) {
+			n.resetElectionDeadline() // not (or no longer) a voter: never campaign
+			return
+		}
 		n.startElection()
 	}
 }
@@ -311,7 +350,8 @@ func (n *Node) applier() {
 		msgs := make([]ApplyMsg, 0, max(0, last-first+1))
 		for i := first; i <= last; i++ {
 			e := n.log[i-n.snapshotIndex]
-			msgs = append(msgs, ApplyMsg{Index: i, Term: e.Term, Command: e.Command, NoOp: e.NoOp})
+			// membership entries carry no client command, so the state machine sees them as no-ops
+			msgs = append(msgs, ApplyMsg{Index: i, Term: e.Term, Command: e.Command, NoOp: e.NoOp || len(e.Members) > 0})
 		}
 		n.mu.Unlock()
 		for _, m := range msgs {
@@ -368,6 +408,8 @@ func (n *Node) persist() {
 		SnapshotIndex: n.snapshotIndex,
 		SnapshotTerm:  n.snapshotTerm,
 		Snapshot:      n.snapshot,
+
+		SnapshotMembers: n.snapshotMembers,
 	})
 	if err != nil {
 		panic(fmt.Sprintf("raft: node %d cannot persist state: %v", n.cfg.ID, err))

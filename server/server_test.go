@@ -144,57 +144,8 @@ func TestLinearizableUnderFailures(t *testing.T) {
 		}
 	}()
 
-	start := time.Now()
-	now := func() int64 { return int64(time.Since(start)) }
-	var mu sync.Mutex
-	var history []linearize.Op
-	record := func(op linearize.Op) {
-		mu.Lock()
-		history = append(history, op)
-		mu.Unlock()
-	}
-
 	deadline := ctx(t, 90*time.Second)
-	var wg sync.WaitGroup
-	for id := 1; id <= clients; id++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			cl := c.clerk(int64(id))
-			rng := rand.New(rand.NewSource(int64(id)))
-			for i := 0; time.Since(start) < runFor; i++ {
-				time.Sleep(time.Duration(30+rng.Intn(80)) * time.Millisecond)
-				key := keys[rng.Intn(len(keys))]
-				op := linearize.Op{Client: id, Key: key}
-				op.Call = now()
-				switch r := rng.Intn(10); {
-				case r < 4:
-					op.Kind, op.Value = linearize.Put, fmt.Sprintf("c%d-%d", id, i)
-					if err := cl.Put(deadline, key, op.Value); err != nil {
-						t.Errorf("client %d: put: %v", id, err)
-						return
-					}
-				case r < 5:
-					op.Kind = linearize.Delete
-					if err := cl.Delete(deadline, key); err != nil {
-						t.Errorf("client %d: delete: %v", id, err)
-						return
-					}
-				default:
-					op.Kind = linearize.Get
-					v, found, err := cl.Get(deadline, key)
-					if err != nil {
-						t.Errorf("client %d: get: %v", id, err)
-						return
-					}
-					op.Value, op.Found = v, found
-				}
-				op.Return = now()
-				record(op)
-			}
-		}(id)
-	}
-	wg.Wait()
+	history := hammer(t, c, clients, keys, runFor, deadline)
 	close(stop)
 	nemesis.Wait()
 	if t.Failed() {
@@ -350,4 +301,61 @@ func TestFollowerRefusesRead(t *testing.T) {
 	if err != server.ErrNotLeader {
 		t.Fatalf("a follower's answer to a read was %v, want ErrNotLeader", err)
 	}
+}
+
+// hammer runs clients against the cluster for runFor, recording every operation with the times it
+// started and finished, for the linearizability checker.
+func hammer(t *testing.T, c *kvCluster, clients int, keys []string, runFor time.Duration, deadline context.Context) []linearize.Op {
+	t.Helper()
+	start := time.Now()
+	now := func() int64 { return int64(time.Since(start)) }
+	var mu sync.Mutex
+	var history []linearize.Op
+	record := func(op linearize.Op) {
+		mu.Lock()
+		history = append(history, op)
+		mu.Unlock()
+	}
+
+	var wg sync.WaitGroup
+	for id := 1; id <= clients; id++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			cl := c.clerk(int64(id))
+			rng := rand.New(rand.NewSource(int64(id)))
+			for i := 0; time.Since(start) < runFor; i++ {
+				time.Sleep(time.Duration(30+rng.Intn(80)) * time.Millisecond)
+				key := keys[rng.Intn(len(keys))]
+				op := linearize.Op{Client: id, Key: key}
+				op.Call = now()
+				switch r := rng.Intn(10); {
+				case r < 4:
+					op.Kind, op.Value = linearize.Put, fmt.Sprintf("c%d-%d", id, i)
+					if err := cl.Put(deadline, key, op.Value); err != nil {
+						t.Errorf("client %d: put: %v", id, err)
+						return
+					}
+				case r < 5:
+					op.Kind = linearize.Delete
+					if err := cl.Delete(deadline, key); err != nil {
+						t.Errorf("client %d: delete: %v", id, err)
+						return
+					}
+				default:
+					op.Kind = linearize.Get
+					v, found, err := cl.Get(deadline, key)
+					if err != nil {
+						t.Errorf("client %d: get: %v", id, err)
+						return
+					}
+					op.Value, op.Found = v, found
+				}
+				op.Return = now()
+				record(op)
+			}
+		}(id)
+	}
+	wg.Wait()
+	return history
 }

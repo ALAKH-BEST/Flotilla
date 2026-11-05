@@ -13,11 +13,14 @@ type State struct {
 	SnapshotIndex int
 	SnapshotTerm  int
 	Snapshot      []byte
+	// SnapshotMembers is the cluster membership as of SnapshotIndex.
+	SnapshotMembers []Member
 }
 
 func (s State) clone() State {
 	s.Log = append([]Entry(nil), s.Log...)
 	s.Snapshot = append([]byte(nil), s.Snapshot...)
+	s.SnapshotMembers = append([]Member(nil), s.SnapshotMembers...)
 	return s
 }
 

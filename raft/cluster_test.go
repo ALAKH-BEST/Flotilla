@@ -24,6 +24,8 @@ type cluster struct {
 	nodes     []*raft.Node
 	stores    []*kv.Store
 	running   []bool
+	initial   int    // how many nodes (IDs 0..initial-1) form the starting cluster
+	joining   []bool // nodes started with Join, to be added later
 	cut       []bool // isolated from the network
 
 	mu        sync.Mutex
@@ -36,7 +38,17 @@ func newCluster(t *testing.T, n int) *cluster { return newSnapshotCluster(t, n, 
 
 func newSnapshotCluster(t *testing.T, n, snapEvery int) *cluster {
 	t.Helper()
+	return newMemberCluster(t, n, n, snapEvery)
+}
+
+// newMemberCluster has room for total nodes but starts only the first initial ones; the rest
+// can be started later with join and added to the cluster with AddServer.
+func newMemberCluster(t *testing.T, initial, total, snapEvery int) *cluster {
+	t.Helper()
+	n := total
 	c := &cluster{
+		initial:   initial,
+		joining:   make([]bool, n),
 		snapEvery: snapEvery,
 		stores:    make([]*kv.Store, n),
 		installed: make([]int, n),
@@ -52,14 +64,16 @@ func newSnapshotCluster(t *testing.T, n, snapEvery int) *cluster {
 	}
 	for i := 0; i < n; i++ {
 		c.storages[i] = raft.NewMemoryStorage()
-		c.start(i)
+		if i < initial {
+			c.start(i)
+		}
 	}
 	t.Cleanup(c.shutdown)
 	return c
 }
 
 func (c *cluster) peers() []int {
-	ids := make([]int, c.n)
+	ids := make([]int, c.initial)
 	for i := range ids {
 		ids[i] = i
 	}
@@ -69,9 +83,14 @@ func (c *cluster) peers() []int {
 // start launches (or relaunches) node i from whatever its storage holds.
 func (c *cluster) start(i int) {
 	applyCh := make(chan raft.ApplyMsg, 256)
+	var peers []int
+	if !c.joining[i] {
+		peers = c.peers()
+	}
 	node, err := raft.New(raft.Config{
 		ID:        i,
-		Peers:     c.peers(),
+		Peers:     peers,
+		Join:      c.joining[i],
 		Transport: c.net.Transport(i),
 		Storage:   c.storages[i],
 		ApplyCh:   applyCh,

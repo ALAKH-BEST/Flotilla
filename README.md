@@ -6,7 +6,7 @@ Raft keeps a cluster of nodes agreeing on one ordered log even when nodes crash 
 
 ## Status
 
-Working: leader election, log replication, persistence across restarts, snapshots with log compaction, a key-value state machine, and a client API with exactly-once writes and linearizable reads, checked against recorded histories. It runs as real processes over TCP with an HTTP API and on-disk state. Not done yet: cluster membership changes (see the roadmap).
+Working: leader election, log replication, persistence across restarts, snapshots with log compaction, a key-value state machine, and a client API with exactly-once writes and linearizable reads, checked against recorded histories. It runs as real processes over TCP with an HTTP API and on-disk state, and servers can be added to and removed from a running cluster.
 
 ## Layout
 
@@ -89,7 +89,20 @@ Talk to any node; followers redirect writes to the leader, and a list of servers
 
 Stop the leader with Ctrl-C and the others elect a new one and keep serving. Start it again with the same `-data` directory and it rejoins and catches up. Without `-data`, state is kept in memory only.
 
-The HTTP API is `GET|PUT|DELETE /kv/{key}` and `GET /status`.
+### Change the cluster
+
+Start the new node with `-join` (its own entry in `-cluster` gives its addresses), then add it. It receives the whole history from the leader, then takes part in elections and commits:
+
+```
+./flotilla server -id 3 -cluster 3=127.0.0.1:7003/127.0.0.1:8003 -data data3 -join
+./flotilla add -server 127.0.0.1:8000 3 127.0.0.1:7003/127.0.0.1:8003
+./flotilla members -server 127.0.0.1:8000
+./flotilla remove -server 127.0.0.1:8000 0
+```
+
+Changes go one server at a time and take effect once committed. Every node learns the new node's address from the log, so a node restarted from its data directory needs no address list. A removed node should be stopped.
+
+The HTTP API is `GET|PUT|DELETE /kv/{key}`, `GET /status`, and for membership `GET /admin/members`, `PUT /admin/members/{id}` (the body is the node's address) and `DELETE /admin/members/{id}`.
 
 ## Tests
 
@@ -110,8 +123,14 @@ The cluster tests run real nodes over `simnet` and check these cases:
 - a follower that fell behind the leader's compacted log catches up from the snapshot
 - nodes restore their state machine from the snapshot after a restart
 - snapshots together with message loss and delay
+- the cluster grows from three to five nodes and shrinks again, and removed nodes still running do not disturb it
+- a leader removes itself and the rest carry on
+- a second change is refused while one is uncommitted, and the last member cannot be removed
+- a membership entry that never committed is undone when its leader is replaced
+- the membership survives log compaction, restarts, and a node that joins after the log was compacted past it
+- with five nodes, two are not a majority
 
-The server tests run five servers with clients hammering them while a nemesis isolates nodes, splits the cluster 2 / 3 and crashes and restarts nodes. Every operation is recorded and the checker in `linearize/` verifies the whole history is linearizable. Targeted tests check that a leader cut off from the majority refuses reads instead of answering from stale data, that reads add nothing to the log, that a new leader refuses a read index until it has committed in its term, that a read waits for the state machine to catch up, and that a duplicated request runs once. I checked that these tests fail when each guarantee is deliberately broken.
+The server tests run five servers with clients hammering them while a nemesis isolates nodes, splits the cluster 2 / 3 and crashes and restarts nodes. Every operation is recorded and the checker in `linearize/` verifies the whole history is linearizable. Targeted tests check that a leader cut off from the majority refuses reads instead of answering from stale data, that reads add nothing to the log, that a new leader refuses a read index until it has committed in its term, that a read waits for the state machine to catch up, and that a duplicated request runs once. A second run of the same kind adds and removes servers at random (the leader included) among the isolations and crashes. I checked that the targeted tests fail when each guarantee is deliberately broken. The random runs are not what catches those breaks, since they inject one fault at a time and rarely build the situations that unsafe membership rules need.
 
 Every applied entry is also compared across replicas, and the test fails if two nodes ever disagree at the same index.
 
@@ -124,6 +143,17 @@ Every applied entry is also compared across replicas, and the test fails if two 
 - A snapshot, its index and term, and the log after it are saved in one write, so they cannot disagree after a crash.
 - A follower that is behind the leader's snapshot receives it in an `InstallSnapshot` RPC, keeps any entries after it that match, and passes it to the state machine before later entries. The snapshot travels in one message; very large ones would need chunking.
 
-## Roadmap
+### Membership changes
 
-- Cluster membership changes
+- One server is added or removed at a time (paper section 6, single-server changes). Any majority of the old membership overlaps any majority of the new one, so two leaders cannot be elected in the same term across a change.
+- The membership is an entry in the log, and a node uses the newest one it has as soon as it is appended, committed or not. If that entry is truncated, the node goes back to the previous membership. Snapshots and `InstallSnapshot` carry the membership, so compaction cannot lose it.
+- A leader starts a change only after it has committed an entry of its own term, and only when no earlier change is uncommitted.
+- A leader can remove itself: it stays leader, not counting itself, until the change commits, then steps down.
+- A node ignores a vote request from a server that is not in its membership, without adopting its term. A removed server that never heard of its removal therefore cannot disrupt the cluster with higher terms. The leader stops replicating to a removed server as soon as the entry is appended, so that server may never learn it was removed; stop it.
+- A new node starts with no members (`-join`), so it cannot elect itself leader of a cluster of one. Add it only after it is running: it counts towards the majority as soon as the entry is appended.
+
+## Not done
+
+- Non-voting learners, so a new node can catch up before it counts towards the majority.
+- Chunked snapshot transfer, and removing a node that is unreachable when its removal is replicated.
+- Leader stepping down when it loses contact with a majority (it stays leader but cannot commit or serve reads).

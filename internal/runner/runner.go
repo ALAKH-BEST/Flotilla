@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ALAKH-BEST/flotilla/raft"
@@ -56,6 +57,9 @@ type Config struct {
 	// lost when the process exits.
 	DataDir       string
 	SnapshotEvery int
+	// Join starts the node outside any cluster: it listens on its own addresses from Cluster
+	// but has no members until the leader adds it (flotilla add). Start it before adding it.
+	Join bool
 
 	// Listeners are optional. When nil the node listens on its own addresses from Cluster.
 	RaftListener net.Listener
@@ -66,6 +70,7 @@ type Config struct {
 type Runner struct {
 	srv       *server.Server
 	transport *tcp.Transport
+	httpAddrs *addressBook
 	stopRaft  func()
 	httpSrv   *http.Server
 	raftAddr  string
@@ -110,12 +115,33 @@ func Start(cfg Config) (*Runner, error) {
 	}
 
 	transport := tcp.New(raftAddrs)
+	book := newAddressBook()
+	var members []raft.Member
+	for _, id := range ids {
+		p := cfg.Cluster[id]
+		book.set(id, p.HTTP)
+		members = append(members, raft.Member{ID: id, Addr: formatAddr(p)})
+	}
+	if cfg.Join {
+		members = nil
+	}
 	srv, err := server.New(server.Config{
 		Raft: raft.Config{
 			ID:        cfg.ID,
-			Peers:     ids,
+			Members:   members,
+			Join:      cfg.Join,
 			Transport: transport,
 			Storage:   storage,
+			// Members added later carry their addresses with them, so every node learns how to
+			// reach them from the log itself.
+			OnMembership: func(ms []raft.Member) {
+				for _, m := range ms {
+					if p, err := parseAddr(m.Addr); err == nil {
+						transport.SetAddr(m.ID, p.Raft)
+						book.set(m.ID, p.HTTP)
+					}
+				}
+			},
 		},
 		SnapshotEvery: cfg.SnapshotEvery,
 	})
@@ -128,13 +154,14 @@ func Start(cfg Config) (*Runner, error) {
 	r := &Runner{
 		srv:       srv,
 		transport: transport,
+		httpAddrs: book,
 		raftAddr:  raftListener.Addr().String(),
 		httpAddr:  httpListener.Addr().String(),
 	}
 	r.stopRaft = tcp.Serve(raftListener, srv)
 	r.httpSrv = &http.Server{
 		Handler: srv.HTTPHandler(server.HTTPOptions{
-			LeaderAddr: func(id int) string { return cfg.Cluster[id].HTTP },
+			LeaderAddr: book.get,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
@@ -158,4 +185,36 @@ func (r *Runner) Stop() {
 	r.stopRaft()
 	r.srv.Stop()
 	r.transport.Close()
+}
+
+// formatAddr and parseAddr turn a Peer into the opaque address string that travels with the
+// cluster membership, and back.
+func formatAddr(p Peer) string { return p.Raft + "/" + p.HTTP }
+
+func parseAddr(s string) (Peer, error) {
+	raftAddr, httpAddr, ok := strings.Cut(s, "/")
+	if !ok || raftAddr == "" || httpAddr == "" {
+		return Peer{}, fmt.Errorf("bad node address %q: want raftHost:port/httpHost:port", s)
+	}
+	return Peer{Raft: raftAddr, HTTP: httpAddr}, nil
+}
+
+// addressBook maps node IDs to client-facing addresses; it grows as members join.
+type addressBook struct {
+	mu    sync.Mutex
+	addrs map[int]string
+}
+
+func newAddressBook() *addressBook { return &addressBook{addrs: make(map[int]string)} }
+
+func (b *addressBook) set(id int, addr string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.addrs[id] = addr
+}
+
+func (b *addressBook) get(id int) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.addrs[id]
 }

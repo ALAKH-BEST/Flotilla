@@ -2,9 +2,9 @@ package raft
 
 // broadcastAppendEntries sends entries (or a heartbeat) to every follower (the lock must be held).
 func (n *Node) broadcastAppendEntries() {
-	for _, peer := range n.cfg.Peers {
-		if peer != n.cfg.ID {
-			go n.replicateTo(peer)
+	for _, m := range n.members {
+		if m.ID != n.cfg.ID {
+			go n.replicateTo(m.ID)
 		}
 	}
 }
@@ -13,7 +13,7 @@ func (n *Node) broadcastAppendEntries() {
 // when the entries it needs have already been compacted away.
 func (n *Node) replicateTo(peer int) {
 	n.mu.Lock()
-	if n.stopped || n.role != Leader {
+	if n.stopped || n.role != Leader || !n.isMember(peer) {
 		n.mu.Unlock()
 		return
 	}
@@ -100,6 +100,7 @@ func (n *Node) sendSnapshot(peer int) {
 		LastIncludedIndex: n.snapshotIndex,
 		LastIncludedTerm:  n.snapshotTerm,
 		Data:              n.snapshot,
+		Members:           n.snapshotMembers,
 	}
 	n.mu.Unlock()
 
@@ -136,14 +137,19 @@ func (n *Node) advanceCommit() {
 			break // only entries from the current term are counted directly
 		}
 		count := 0
-		for _, peer := range n.cfg.Peers {
-			if n.matchIndex[peer] >= idx {
+		for _, m := range n.members { // a leader that has been removed does not count itself
+			if n.matchIndex[m.ID] >= idx {
 				count++
 			}
 		}
-		if count*2 > len(n.cfg.Peers) {
+		if n.isMajority(count) {
 			n.commitIndex = idx
 			n.applyCond.Broadcast()
+			if !n.isMember(n.cfg.ID) {
+				// The membership that dropped this leader has committed, so its job is done.
+				n.becomeFollower(n.currentTerm)
+				n.resetElectionDeadline()
+			}
 			return
 		}
 	}
@@ -206,6 +212,7 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply 
 	}
 	if changed {
 		n.persist()
+		n.refreshMembers() // an appended entry may change the membership; a truncated one may undo it
 	}
 
 	if args.LeaderCommit > n.commitIndex {
@@ -244,10 +251,14 @@ func (n *Node) HandleInstallSnapshot(args *InstallSnapshotArgs) *InstallSnapshot
 	}
 	n.snapshotIndex = args.LastIncludedIndex
 	n.snapshotTerm = args.LastIncludedTerm
+	if len(args.Members) > 0 {
+		n.snapshotMembers = args.Members
+	}
 	n.snapshot = append([]byte(nil), args.Data...)
 	n.commitIndex = args.LastIncludedIndex
 	n.lastApplied = args.LastIncludedIndex
 	n.pendingSnapshot = n.snapshotMsg()
+	n.refreshMembers()
 	n.persist()
 	n.applyCond.Broadcast()
 	return reply

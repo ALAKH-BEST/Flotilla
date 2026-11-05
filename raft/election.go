@@ -18,12 +18,14 @@ func (n *Node) startElection() {
 		LastLogIndex: n.lastLogIndex(),
 		LastLogTerm:  n.lastLogTerm(),
 	}
-	votes := 1 // our own
-	if votes*2 > len(n.cfg.Peers) {
+	voters := append([]Member(nil), n.members...) // the membership this election is held under
+	granted := 1                                  // our own vote
+	if granted*2 > len(voters) {
 		n.becomeLeader()
 		return
 	}
-	for _, peer := range n.cfg.Peers {
+	for _, m := range voters {
+		peer := m.ID
 		if peer == n.cfg.ID {
 			continue
 		}
@@ -43,8 +45,8 @@ func (n *Node) startElection() {
 				return
 			}
 			if reply.VoteGranted {
-				votes++
-				if votes*2 > len(n.cfg.Peers) {
+				granted++
+				if granted*2 > len(voters) {
 					n.becomeLeader()
 				}
 			}
@@ -62,10 +64,10 @@ func (n *Node) becomeLeader() {
 	n.log = append(n.log, Entry{Term: n.currentTerm, NoOp: true})
 	n.persist()
 	last := n.lastLogIndex()
-	for _, peer := range n.cfg.Peers {
-		n.nextIndex[peer] = last // the no-op is the first entry to send
-		n.matchIndex[peer] = 0
-		n.ackSeq[peer] = 0
+	for _, m := range n.members {
+		n.nextIndex[m.ID] = last // the no-op is the first entry to send
+		n.matchIndex[m.ID] = 0
+		n.ackSeq[m.ID] = 0
 	}
 	n.matchIndex[n.cfg.ID] = last
 	n.nextHeartbeat = time.Now().Add(n.cfg.HeartbeatInterval)
@@ -78,6 +80,12 @@ func (n *Node) HandleRequestVote(args *RequestVoteArgs) *RequestVoteReply {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.stopped || args.Term < n.currentTerm {
+		return &RequestVoteReply{Term: n.currentTerm}
+	}
+	// A server that is not in our membership cannot lead us. Ignoring it entirely, without even
+	// adopting its term, stops a removed server that never heard of its removal from
+	// disrupting the cluster with ever higher terms.
+	if len(n.members) > 0 && !n.isMember(args.CandidateID) {
 		return &RequestVoteReply{Term: n.currentTerm}
 	}
 	if args.Term > n.currentTerm {

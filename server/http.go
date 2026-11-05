@@ -9,6 +9,7 @@ import (
 	"strconv"
 
 	"github.com/ALAKH-BEST/flotilla/kv"
+	"github.com/ALAKH-BEST/flotilla/raft"
 )
 
 const maxValueBytes = 1 << 20
@@ -26,6 +27,12 @@ type HTTPOptions struct {
 //	PUT    /kv/{key}   set the key to the request body
 //	DELETE /kv/{key}   remove the key
 //	GET    /status     this node's view of the cluster, as JSON
+//
+// Membership (changes are followed by a redirect to the leader, like writes):
+//
+//	GET    /admin/members       the voting members
+//	PUT    /admin/members/{id}  add node id; the body is its address, passed on to every node
+//	DELETE /admin/members/{id}  remove node id
 //
 // A node that is not the leader answers with a 307 redirect to the leader when it knows
 // one, and 503 otherwise. A client that wants a retried write to run exactly once sends
@@ -59,6 +66,43 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 		}
 	})
+	mux.HandleFunc("GET /admin/members", func(w http.ResponseWriter, r *http.Request) {
+		type member struct {
+			ID   int    `json:"id"`
+			Addr string `json:"addr,omitempty"`
+		}
+		var out []member
+		for _, m := range s.node.Members() {
+			out = append(out, member{m.ID, m.Addr})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+	})
+	mux.HandleFunc("PUT /admin/members/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.Atoi(r.PathValue("id"))
+		addr, err2 := io.ReadAll(http.MaxBytesReader(w, r.Body, 1024))
+		if err != nil || err2 != nil || id < 0 {
+			http.Error(w, "want PUT /admin/members/{id} with the node's address as the body", http.StatusBadRequest)
+			return
+		}
+		if err := s.AddServer(r.Context(), id, string(addr)); err != nil {
+			s.fail(w, r, opts, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("DELETE /admin/members/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil || id < 0 {
+			http.Error(w, "want DELETE /admin/members/{id}", http.StatusBadRequest)
+			return
+		}
+		if err := s.RemoveServer(r.Context(), id); err != nil {
+			s.fail(w, r, opts, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		st := s.node.Status()
 		w.Header().Set("Content-Type", "application/json")
@@ -71,6 +115,7 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 			"lastLogIndex":  st.LastLogIndex,
 			"snapshotIndex": st.SnapshotIndex,
 			"logEntries":    st.LogEntries,
+			"members":       st.Members,
 		})
 	})
 	return mux
@@ -95,15 +140,22 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, opts HTTPOptions,
 	}
 
 	res, err := s.Do(r.Context(), cmd)
+	if err != nil {
+		s.fail(w, r, opts, err)
+		return kv.Result{}, false
+	}
+	return res, true
+}
+
+// fail writes the response for an error from Do, AddServer or RemoveServer.
+func (s *Server) fail(w http.ResponseWriter, r *http.Request, opts HTTPOptions, err error) {
 	switch {
-	case err == nil:
-		return res, true
 	case errors.Is(err, ErrNotLeader):
-		leader := s.node.Status().LeaderID
-		if opts.LeaderAddr != nil && leader >= 0 && leader != s.node.Status().ID {
-			if addr := opts.LeaderAddr(leader); addr != "" {
+		st := s.node.Status()
+		if opts.LeaderAddr != nil && st.LeaderID >= 0 && st.LeaderID != st.ID {
+			if addr := opts.LeaderAddr(st.LeaderID); addr != "" {
 				http.Redirect(w, r, "http://"+addr+r.URL.RequestURI(), http.StatusTemporaryRedirect)
-				return kv.Result{}, false
+				return
 			}
 		}
 		http.Error(w, "no leader known, try again shortly", http.StatusServiceUnavailable)
@@ -111,8 +163,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, opts HTTPOptions,
 		http.Error(w, "request timed out", http.StatusGatewayTimeout)
 	case errors.Is(err, context.Canceled):
 		// the client went away; nothing to write
-	default:
+	case errors.Is(err, raft.ErrAlreadyMember), errors.Is(err, raft.ErrNotMember),
+		errors.Is(err, raft.ErrLastMember), errors.Is(err, raft.ErrChangeInProgress):
+		http.Error(w, err.Error(), http.StatusConflict)
+	default: // including raft.ErrNotReady: a new leader that cannot yet accept this, so try again
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 	}
-	return kv.Result{}, false
 }

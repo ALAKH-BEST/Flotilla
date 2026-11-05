@@ -34,12 +34,31 @@ var _ raft.Transport = (*Transport)(nil)
 
 // New creates a transport. addrs maps every node ID to its Raft address (host:port).
 func New(addrs map[int]string) *Transport {
+	known := make(map[int]string, len(addrs))
+	for id, a := range addrs {
+		known[id] = a
+	}
 	return &Transport{
-		addrs:           addrs,
+		addrs:           known,
 		DialTimeout:     300 * time.Millisecond,
 		CallTimeout:     time.Second,
 		SnapshotTimeout: 10 * time.Second,
 		clients:         make(map[int]*rpc.Client),
+	}
+}
+
+// SetAddr records where a node can be reached, for nodes that join after the transport was
+// created. If the node was reachable somewhere else before, the old connection is dropped.
+func (t *Transport) SetAddr(id int, addr string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.addrs[id] == addr {
+		return
+	}
+	t.addrs[id] = addr
+	if c := t.clients[id]; c != nil {
+		c.Close()
+		delete(t.clients, id)
 	}
 }
 
