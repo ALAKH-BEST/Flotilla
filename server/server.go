@@ -154,15 +154,71 @@ func (s *Server) Do(ctx context.Context, cmd kv.Command) (kv.Result, error) {
 	})
 }
 
-// AddServer adds a node to the cluster and returns once the change has committed. Start the new
-// node first (with raft.Config.Join) so it can receive the log. addr travels with the
-// membership, so every node learns where to reach the new one.
+// How AddServer decides a new node has caught up: it has everything up to its own membership
+// entry and trails the commit index by at most this many entries. Safety never depends on this;
+// a node promoted too early only costs availability until it catches up.
+const (
+	catchUpSlack   = 8
+	catchUpTimeout = 60 * time.Second
+)
+
+// AddServer adds a node to the cluster and returns once it is a voter. It first adds the node as
+// a non-voting learner, so the cluster's majority is unchanged while the node receives the log,
+// and promotes it when it has caught up. Start the new node first (with raft.Config.Join). If
+// this fails part way, the node stays a learner and calling AddServer again resumes. addr travels
+// with the membership, so every node learns where to reach the new one.
 func (s *Server) AddServer(ctx context.Context, id int, addr string) error {
+	ctx, cancel := context.WithTimeout(ctx, catchUpTimeout)
+	defer cancel()
+	timedOut := func(err error) error {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return ErrTimeout
+		}
+		return err
+	}
+
+	need, learner := 0, false
+	for _, m := range s.node.Members() {
+		if m.ID == id {
+			if !m.Learner {
+				return raft.ErrAlreadyMember
+			}
+			learner = true
+		}
+	}
+	if !learner {
+		_, err := s.submit(ctx, func() (int, int, error) {
+			index, term, err := s.node.AddLearner(raft.Member{ID: id, Addr: addr})
+			need = index
+			return index, term, mapRaftErr(err)
+		})
+		if err != nil {
+			return timedOut(err)
+		}
+	}
+
+	for {
+		match, commit, err := s.node.CatchUp(id)
+		if err != nil {
+			return mapRaftErr(err)
+		}
+		if match >= need && commit-match <= catchUpSlack {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return timedOut(ctx.Err())
+		case <-s.stopCh:
+			return ErrStopped
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+
 	_, err := s.submit(ctx, func() (int, int, error) {
-		index, term, err := s.node.AddServer(raft.Member{ID: id, Addr: addr})
+		index, term, err := s.node.PromoteLearner(id)
 		return index, term, mapRaftErr(err)
 	})
-	return err
+	return timedOut(err)
 }
 
 // RemoveServer removes a node from the cluster and returns once the change has committed. The

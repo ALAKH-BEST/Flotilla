@@ -125,7 +125,11 @@ func runClient(cmd string, args []string) error {
 		body = rest[len(rest)-1]
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	timeout := 5 * time.Second
+	if cmd == "add" {
+		timeout = 70 * time.Second // the server waits for the new node to catch up first
+	}
+	client := &http.Client{Timeout: timeout}
 	var lastErr error
 	for _, addr := range strings.Split(*servers, ",") {
 		req, err := http.NewRequest(method, "http://"+strings.TrimSpace(addr)+path, strings.NewReader(body))

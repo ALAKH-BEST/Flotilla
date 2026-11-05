@@ -137,7 +137,7 @@ func (n *Node) advanceCommit() {
 			break // only entries from the current term are counted directly
 		}
 		count := 0
-		for _, m := range n.members { // a leader that has been removed does not count itself
+		for _, m := range n.voters() { // a removed leader does not count itself; learners never count
 			if n.matchIndex[m.ID] >= idx {
 				count++
 			}
@@ -145,7 +145,7 @@ func (n *Node) advanceCommit() {
 		if n.isMajority(count) {
 			n.commitIndex = idx
 			n.applyCond.Broadcast()
-			if !n.isMember(n.cfg.ID) {
+			if !n.isVoter(n.cfg.ID) {
 				// The membership that dropped this leader has committed, so its job is done.
 				n.becomeFollower(n.currentTerm)
 				n.resetElectionDeadline()

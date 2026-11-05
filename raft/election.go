@@ -18,8 +18,8 @@ func (n *Node) startElection() {
 		LastLogIndex: n.lastLogIndex(),
 		LastLogTerm:  n.lastLogTerm(),
 	}
-	voters := append([]Member(nil), n.members...) // the membership this election is held under
-	granted := 1                                  // our own vote
+	voters := n.voters() // the voters this election is held under
+	granted := 1         // our own vote
 	if granted*2 > len(voters) {
 		n.becomeLeader()
 		return
@@ -82,10 +82,10 @@ func (n *Node) HandleRequestVote(args *RequestVoteArgs) *RequestVoteReply {
 	if n.stopped || args.Term < n.currentTerm {
 		return &RequestVoteReply{Term: n.currentTerm}
 	}
-	// A server that is not in our membership cannot lead us. Ignoring it entirely, without even
+	// A server that is not a voter in our membership cannot lead us. Ignoring it entirely, without even
 	// adopting its term, stops a removed server that never heard of its removal from
 	// disrupting the cluster with ever higher terms.
-	if len(n.members) > 0 && !n.isMember(args.CandidateID) {
+	if len(n.members) > 0 && !n.isVoter(args.CandidateID) {
 		return &RequestVoteReply{Term: n.currentTerm}
 	}
 	if args.Term > n.currentTerm {

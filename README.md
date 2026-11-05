@@ -91,7 +91,7 @@ Stop the leader with Ctrl-C and the others elect a new one and keep serving. Sta
 
 ### Change the cluster
 
-Start the new node with `-join` (its own entry in `-cluster` gives its addresses), then add it. It receives the whole history from the leader, then takes part in elections and commits:
+Start the new node with `-join` (its own entry in `-cluster` gives its addresses), then add it. The leader first adds it as a non-voting learner and sends it the history, and promotes it to a voter once it has caught up, so a slow or broken new node never affects the cluster's majority:
 
 ```
 ./flotilla server -id 3 -cluster 3=127.0.0.1:7003/127.0.0.1:8003 -data data3 -join
@@ -100,9 +100,9 @@ Start the new node with `-join` (its own entry in `-cluster` gives its addresses
 ./flotilla remove -server 127.0.0.1:8000 0
 ```
 
-Changes go one server at a time and take effect once committed. Every node learns the new node's address from the log, so a node restarted from its data directory needs no address list. A removed node should be stopped.
+`members` marks learners. Changes go one server at a time and take effect once committed. Every node learns the new node's address from the log, so a node restarted from its data directory needs no address list. A removed node should be stopped.
 
-The HTTP API is `GET|PUT|DELETE /kv/{key}`, `GET /status`, and for membership `GET /admin/members`, `PUT /admin/members/{id}` (the body is the node's address) and `DELETE /admin/members/{id}`.
+The HTTP API is `GET|PUT|DELETE /kv/{key}`, `GET /status`, and for membership `GET /admin/members`, `PUT /admin/members/{id}` (the body is the node's address; it returns once the node is a voter) and `DELETE /admin/members/{id}`.
 
 ## Tests
 
@@ -127,6 +127,8 @@ The cluster tests run real nodes over `simnet` and check these cases:
 - a leader removes itself and the rest carry on
 - a second change is refused while one is uncommitted, and the last member cannot be removed
 - a membership entry that never committed is undone when its leader is replaced
+- a learner does not count towards a majority and never campaigns, and a learner can be promoted or removed
+- adding a server waits for the new node to catch up before promoting it
 - the membership survives log compaction, restarts, and a node that joins after the log was compacted past it
 - with five nodes, two are not a majority
 
@@ -150,10 +152,10 @@ Every applied entry is also compared across replicas, and the test fails if two 
 - A leader starts a change only after it has committed an entry of its own term, and only when no earlier change is uncommitted.
 - A leader can remove itself: it stays leader, not counting itself, until the change commits, then steps down.
 - A node ignores a vote request from a server that is not in its membership, without adopting its term. A removed server that never heard of its removal therefore cannot disrupt the cluster with higher terms. The leader stops replicating to a removed server as soon as the entry is appended, so that server may never learn it was removed; stop it.
-- A new node starts with no members (`-join`), so it cannot elect itself leader of a cluster of one. Add it only after it is running: it counts towards the majority as soon as the entry is appended.
+- A new node starts with no members (`-join`), so it cannot elect itself leader of a cluster of one.
+- A new node is added as a learner: it receives the log and snapshots but does not vote, campaign, or count towards commits or read confirmation. Only promoting it changes the voters, one server at a time. `AddServer` on the server waits until the learner trails the commit index by a few entries before promoting it; this only protects availability, not safety. If it fails part way the node stays a learner and `add` can be run again.
 
 ## Not done
 
-- Non-voting learners, so a new node can catch up before it counts towards the majority.
 - Chunked snapshot transfer, and removing a node that is unreachable when its removal is replicated.
 - Leader stepping down when it loses contact with a majority (it stays leader but cannot commit or serve reads).

@@ -30,8 +30,9 @@ type HTTPOptions struct {
 //
 // Membership (changes are followed by a redirect to the leader, like writes):
 //
-//	GET    /admin/members       the voting members
-//	PUT    /admin/members/{id}  add node id; the body is its address, passed on to every node
+//	GET    /admin/members       the members; learners are marked
+//	PUT    /admin/members/{id}  add node id as a learner, then promote it to a voter once it has
+//	                            caught up; the body is its address, passed on to every node
 //	DELETE /admin/members/{id}  remove node id
 //
 // A node that is not the leader answers with a 307 redirect to the leader when it knows
@@ -68,12 +69,13 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 	})
 	mux.HandleFunc("GET /admin/members", func(w http.ResponseWriter, r *http.Request) {
 		type member struct {
-			ID   int    `json:"id"`
-			Addr string `json:"addr,omitempty"`
+			ID      int    `json:"id"`
+			Addr    string `json:"addr,omitempty"`
+			Learner bool   `json:"learner,omitempty"`
 		}
 		var out []member
 		for _, m := range s.node.Members() {
-			out = append(out, member{m.ID, m.Addr})
+			out = append(out, member{m.ID, m.Addr, m.Learner})
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(out)
@@ -116,6 +118,7 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 			"snapshotIndex": st.SnapshotIndex,
 			"logEntries":    st.LogEntries,
 			"members":       st.Members,
+			"learners":      st.Learners,
 		})
 	})
 	return mux
@@ -164,7 +167,8 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, opts HTTPOptions, 
 	case errors.Is(err, context.Canceled):
 		// the client went away; nothing to write
 	case errors.Is(err, raft.ErrAlreadyMember), errors.Is(err, raft.ErrNotMember),
-		errors.Is(err, raft.ErrLastMember), errors.Is(err, raft.ErrChangeInProgress):
+		errors.Is(err, raft.ErrLastMember), errors.Is(err, raft.ErrChangeInProgress),
+		errors.Is(err, raft.ErrNotLearner):
 		http.Error(w, err.Error(), http.StatusConflict)
 	default: // including raft.ErrNotReady: a new leader that cannot yet accept this, so try again
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)

@@ -51,10 +51,57 @@ func (c *cluster) changeMembers(op func(*raft.Node) (int, int, error)) int {
 	return -1
 }
 
-func (c *cluster) add(i int) int {
+// addLearner starts node i and adds it as a non-voting learner.
+func (c *cluster) addLearner(i int) int {
 	c.t.Helper()
 	c.join(i)
-	return c.changeMembers(func(n *raft.Node) (int, int, error) { return n.AddServer(raft.Member{ID: i}) })
+	return c.changeMembers(func(n *raft.Node) (int, int, error) { return n.AddLearner(raft.Member{ID: i}) })
+}
+
+// waitCaughtUp waits until the leader reports node i has replicated nearly the whole log.
+func (c *cluster) waitCaughtUp(i int) {
+	c.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		for j := 0; j < c.n; j++ {
+			if !c.reachable(j) {
+				continue
+			}
+			if match, commit, err := c.nodes[j].CatchUp(i); err == nil && match > 0 && commit-match <= 2 {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	c.t.Fatalf("node %d never caught up", i)
+}
+
+func (c *cluster) promote(i int) int {
+	c.t.Helper()
+	return c.changeMembers(func(n *raft.Node) (int, int, error) { return n.PromoteLearner(i) })
+}
+
+// add brings a new node in the way the server does: as a learner first, then as a voter.
+func (c *cluster) add(i int) int {
+	c.t.Helper()
+	c.addLearner(i)
+	c.waitCaughtUp(i)
+	return c.promote(i)
+}
+
+func (c *cluster) waitLearners(i int, want ...int) {
+	c.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		got := c.nodes[i].Status().Learners
+		if reflect.DeepEqual(got, want) || (len(got) == 0 && len(want) == 0) {
+			return
+		}
+		if time.Now().After(deadline) {
+			c.t.Fatalf("node %d has learners %v, want %v", i, got, want)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func (c *cluster) remove(i int) int {
@@ -173,10 +220,10 @@ func TestMembershipChangeRules(t *testing.T) {
 	c.put("k", "v", 3)
 
 	follower := (leader + 1) % 3
-	if _, _, err := c.nodes[follower].AddServer(raft.Member{ID: 3}); !errors.Is(err, raft.ErrNotLeader) {
-		t.Fatalf("AddServer on a follower: %v, want ErrNotLeader", err)
+	if _, _, err := c.nodes[follower].AddLearner(raft.Member{ID: 3}); !errors.Is(err, raft.ErrNotLeader) {
+		t.Fatalf("AddLearner on a follower: %v, want ErrNotLeader", err)
 	}
-	if _, _, err := c.nodes[leader].AddServer(raft.Member{ID: 1}); !errors.Is(err, raft.ErrAlreadyMember) {
+	if _, _, err := c.nodes[leader].AddLearner(raft.Member{ID: 1}); !errors.Is(err, raft.ErrAlreadyMember) {
 		t.Fatalf("adding an existing member: %v, want ErrAlreadyMember", err)
 	}
 	if _, _, err := c.nodes[leader].RemoveServer(9); !errors.Is(err, raft.ErrNotMember) {
@@ -187,10 +234,10 @@ func TestMembershipChangeRules(t *testing.T) {
 	// Two changes in flight at once could let two disjoint majorities form.
 	c.isolate(follower)
 	c.isolate((leader + 2) % 3)
-	if _, _, err := c.nodes[leader].AddServer(raft.Member{ID: 3}); err != nil {
+	if _, _, err := c.nodes[leader].AddLearner(raft.Member{ID: 3}); err != nil {
 		t.Fatalf("first change: %v", err)
 	}
-	if _, _, err := c.nodes[leader].AddServer(raft.Member{ID: 4}); !errors.Is(err, raft.ErrChangeInProgress) {
+	if _, _, err := c.nodes[leader].AddLearner(raft.Member{ID: 4}); !errors.Is(err, raft.ErrChangeInProgress) {
 		t.Fatalf("second change while the first is uncommitted: %v, want ErrChangeInProgress", err)
 	}
 	if _, _, err := c.nodes[leader].RemoveServer(follower); !errors.Is(err, raft.ErrChangeInProgress) {
@@ -214,16 +261,17 @@ func TestUncommittedMembershipChangeIsUndone(t *testing.T) {
 	c.put("k", "v", 3)
 
 	c.isolate(old)
-	if _, _, err := c.nodes[old].AddServer(raft.Member{ID: 3}); err != nil {
+	if _, _, err := c.nodes[old].AddLearner(raft.Member{ID: 3}); err != nil {
 		t.Fatal(err)
 	}
-	if got := c.nodes[old].Status().Members; len(got) != 4 {
-		t.Fatalf("the leader should use the new membership at once, has %v", got)
+	if got := c.nodes[old].Status().Learners; len(got) != 1 {
+		t.Fatalf("the leader should use the new membership at once, has learners %v", got)
 	}
 	c.put("k2", "v2", 2) // the others elect a new leader and commit something else
 	c.reconnect(old)
 
 	c.waitMembers(old, 0, 1, 2)
+	c.waitLearners(old) // the uncommitted learner is gone
 	c.waitStoresEqual()
 	c.checkOneLeader()
 }
@@ -253,7 +301,7 @@ func TestMembershipSurvivesSnapshotsAndRestarts(t *testing.T) {
 	// entry before it reconnects. The membership can then only reach it inside the snapshot.
 	c.join(4)
 	c.isolate(4)
-	addIndex := c.changeMembers(func(n *raft.Node) (int, int, error) { return n.AddServer(raft.Member{ID: 4}) })
+	addIndex := c.changeMembers(func(n *raft.Node) (int, int, error) { return n.AddLearner(raft.Member{ID: 4}) })
 	for i := 0; i < 40; i++ {
 		c.put(fmt.Sprintf("m%d", i), "v", 4)
 	}
@@ -261,6 +309,10 @@ func TestMembershipSurvivesSnapshotsAndRestarts(t *testing.T) {
 		t.Fatalf("the log is only compacted to %d, not past the membership entry at %d", st.SnapshotIndex, addIndex)
 	}
 	c.reconnect(4)
+	c.waitMembers(4, 0, 1, 2, 3) // it learns the cluster, and that it is a learner, from the snapshot
+	c.waitLearners(4, 4)
+	c.waitCaughtUp(4)
+	c.promote(4)
 	for i := 0; i < 5; i++ {
 		c.waitMembers(i, 0, 1, 2, 3, 4)
 	}
@@ -300,4 +352,75 @@ func TestCommitNeedsAMajorityOfTheCurrentMembership(t *testing.T) {
 
 	c.heal()
 	c.put("after", "heal", 5) // with a majority again, everything commits
+}
+
+// A learner gets the log but is not a voter: it does not count towards a majority.
+func TestLearnerDoesNotCountTowardsMajority(t *testing.T) {
+	c := newMemberCluster(t, 3, 4, 0)
+	leader := c.checkOneLeader()
+	c.put("a", "1", 3)
+
+	c.join(3)
+	c.isolate(3) // a learner that cannot be reached
+	c.changeMembers(func(n *raft.Node) (int, int, error) { return n.AddLearner(raft.Member{ID: 3}) })
+
+	// Three voters and one unreachable learner: one voter down must not stop commits. If the
+	// learner counted, a majority would be three of four, and the leader plus one voter would
+	// not be enough.
+	c.isolate((leader + 1) % 3)
+	c.put("b", "2", 2)
+}
+
+// A learner never starts an election, however long it hears nothing.
+func TestLearnerNeverCampaigns(t *testing.T) {
+	c := newMemberCluster(t, 3, 4, 0)
+	c.checkOneLeader()
+	c.addLearner(3)
+	c.waitCaughtUp(3)
+
+	c.isolate(3)
+	term := c.nodes[3].Status().Term
+	time.Sleep(2 * time.Second) // many election timeouts
+	if st := c.nodes[3].Status(); st.Role != raft.Follower || st.Term != term {
+		t.Fatalf("an isolated learner started an election: %+v (term was %d)", st, term)
+	}
+}
+
+func TestPromoteAndRemoveLearner(t *testing.T) {
+	c := newMemberCluster(t, 3, 4, 0)
+	leader := c.checkOneLeader()
+	c.put("a", "1", 3)
+
+	if _, _, err := c.nodes[leader].PromoteLearner(0); !errors.Is(err, raft.ErrNotLearner) {
+		t.Fatalf("promoting a voter: %v, want ErrNotLearner", err)
+	}
+	if _, _, err := c.nodes[leader].PromoteLearner(3); !errors.Is(err, raft.ErrNotMember) {
+		t.Fatalf("promoting a stranger: %v, want ErrNotMember", err)
+	}
+
+	c.addLearner(3)
+	c.waitCaughtUp(3)
+	c.waitMembers(leader, 0, 1, 2)
+	c.waitLearners(leader, 3)
+	c.waitStoresEqual() // the learner has the data
+	c.promote(3)
+	c.waitMembers(leader, 0, 1, 2, 3)
+	c.waitLearners(leader)
+
+	// A learner can also be dropped without ever voting.
+	c2 := newMemberCluster(t, 3, 4, 0)
+	c2.checkOneLeader()
+	c2.addLearner(3)
+	c2.remove(3)
+	c2.waitMembers(c2.checkOneLeader(), 0, 1, 2)
+}
+
+// The last voter cannot be removed even if a learner is still there.
+func TestLastVoterCannotBeRemovedEvenWithALearner(t *testing.T) {
+	c := newMemberCluster(t, 1, 2, 0)
+	c.checkOneLeader()
+	c.addLearner(1)
+	if _, _, err := c.nodes[0].RemoveServer(0); !errors.Is(err, raft.ErrLastMember) {
+		t.Fatalf("removing the only voter: %v, want ErrLastMember", err)
+	}
 }

@@ -12,7 +12,9 @@ var (
 	// ErrAlreadyMember and ErrNotMember report a change that would do nothing.
 	ErrAlreadyMember = errors.New("raft: that server is already a member")
 	ErrNotMember     = errors.New("raft: that server is not a member")
-	// ErrLastMember means the change would leave the cluster with no members.
+	// ErrNotLearner means the server is already a voter.
+	ErrNotLearner = errors.New("raft: that server is not a learner")
+	// ErrLastMember means the change would leave the cluster with no voters.
 	ErrLastMember = errors.New("raft: cannot remove the last member")
 )
 
@@ -80,16 +82,45 @@ func (n *Node) isMember(id int) bool {
 	return false
 }
 
-func (n *Node) memberIDs() []int {
-	ids := make([]int, 0, len(n.members))
+func (n *Node) isVoter(id int) bool {
 	for _, m := range n.members {
+		if m.ID == id && !m.Learner {
+			return true
+		}
+	}
+	return false
+}
+
+func (n *Node) voters() []Member {
+	var out []Member
+	for _, m := range n.members {
+		if !m.Learner {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func (n *Node) voterIDs() []int {
+	ids := []int{}
+	for _, m := range n.voters() {
 		ids = append(ids, m.ID)
 	}
 	return ids
 }
 
-// isMajority reports whether count nodes are a majority of the current membership.
-func (n *Node) isMajority(count int) bool { return count*2 > len(n.members) }
+func (n *Node) learnerIDs() []int {
+	ids := []int{}
+	for _, m := range n.members {
+		if m.Learner {
+			ids = append(ids, m.ID)
+		}
+	}
+	return ids
+}
+
+// isMajority reports whether count nodes are a majority of the voters.
+func (n *Node) isMajority(count int) bool { return count*2 > len(n.voters()) }
 
 // Members returns the voting members this node currently uses.
 func (n *Node) Members() []Member {
@@ -98,10 +129,11 @@ func (n *Node) Members() []Member {
 	return append([]Member(nil), n.members...)
 }
 
-// AddServer starts adding a server to the cluster. It returns the index and term of the
+// AddLearner starts adding a server as a non-voting member. It returns the index and term of the
 // membership entry, which takes effect on this leader at once and is done when that index
-// commits. Start the new node (with Config.Join) first, so it can receive the log.
-func (n *Node) AddServer(m Member) (index, term int, err error) {
+// commits. The voters do not change, so this cannot affect availability. Start the new node
+// (with Config.Join) first, wait until CatchUp reports it has the log, then PromoteLearner.
+func (n *Node) AddLearner(m Member) (index, term int, err error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if err := n.canChange(); err != nil {
@@ -110,10 +142,34 @@ func (n *Node) AddServer(m Member) (index, term int, err error) {
 	if n.isMember(m.ID) {
 		return 0, 0, ErrAlreadyMember
 	}
+	m.Learner = true
 	return n.proposeMembers(sortedMembers(append(append([]Member(nil), n.members...), m)))
 }
 
-// RemoveServer starts removing a server from the cluster, with the same guarantees as AddServer.
+// PromoteLearner makes a learner a voter, with the same guarantees as AddLearner. This is the
+// one-server change to the voters.
+func (n *Node) PromoteLearner(id int) (index, term int, err error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if err := n.canChange(); err != nil {
+		return 0, 0, err
+	}
+	if !n.isMember(id) {
+		return 0, 0, ErrNotMember
+	}
+	if n.isVoter(id) {
+		return 0, 0, ErrNotLearner
+	}
+	next := append([]Member(nil), n.members...)
+	for i := range next {
+		if next[i].ID == id {
+			next[i].Learner = false
+		}
+	}
+	return n.proposeMembers(next)
+}
+
+// RemoveServer starts removing a voter or a learner, with the same guarantees as AddLearner.
 // A leader can remove itself: it keeps leading until the change commits, then steps down.
 func (n *Node) RemoveServer(id int) (index, term int, err error) {
 	n.mu.Lock()
@@ -124,7 +180,7 @@ func (n *Node) RemoveServer(id int) (index, term int, err error) {
 	if !n.isMember(id) {
 		return 0, 0, ErrNotMember
 	}
-	if len(n.members) == 1 {
+	if n.isVoter(id) && len(n.voters()) == 1 {
 		return 0, 0, ErrLastMember
 	}
 	var rest []Member
@@ -134,6 +190,23 @@ func (n *Node) RemoveServer(id int) (index, term int, err error) {
 		}
 	}
 	return n.proposeMembers(rest)
+}
+
+// CatchUp reports how far a member's log trails this leader's commit index, and the index it has
+// replicated up to. It is how a caller decides a learner is ready to be promoted.
+func (n *Node) CatchUp(id int) (match, commit int, err error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.stopped {
+		return 0, 0, ErrStopped
+	}
+	if n.role != Leader {
+		return 0, 0, ErrNotLeader
+	}
+	if !n.isMember(id) {
+		return 0, 0, ErrNotMember
+	}
+	return n.matchIndex[id], n.commitIndex, nil
 }
 
 // canChange checks the conditions for starting a membership change (the lock must be held).

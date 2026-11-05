@@ -24,7 +24,7 @@ type Config struct {
 	Peers   []int
 	Members []Member
 	// Join starts a node that is not yet part of any cluster. It has no members, so it does
-	// not campaign, and learns the membership from the leader once it is added with AddServer.
+	// not campaign, and learns the membership from the leader once it is added with AddLearner.
 	Join bool
 	// OnMembership is called with the voting members whenever this node's view of them
 	// changes (and once at Start). It runs with the node's lock held, so it must be quick
@@ -253,7 +253,8 @@ func (n *Node) Status() Status {
 
 		SnapshotIndex: n.snapshotIndex,
 		LogEntries:    len(n.log) - 1,
-		Members:       n.memberIDs(),
+		Members:       n.voterIDs(),
+		Learners:      n.learnerIDs(),
 	}
 }
 
@@ -312,7 +313,7 @@ func (n *Node) tick(now time.Time) {
 		return
 	}
 	if !now.Before(n.electionDeadline) {
-		if !n.isMember(n.cfg.ID) {
+		if !n.isVoter(n.cfg.ID) {
 			n.resetElectionDeadline() // not (or no longer) a voter: never campaign
 			return
 		}

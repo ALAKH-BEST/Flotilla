@@ -69,7 +69,7 @@ func (n *Node) ReadIndex(ctx context.Context) (int, error) {
 // (the lock must be held).
 func (n *Node) confirmed(seq int) bool {
 	count := 0
-	for _, m := range n.members {
+	for _, m := range n.voters() {
 		if m.ID == n.cfg.ID || n.ackSeq[m.ID] > seq {
 			count++
 		}

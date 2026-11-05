@@ -20,6 +20,9 @@ type Entry struct {
 type Member struct {
 	ID   int
 	Addr string
+	// Learner marks a non-voting member. It receives the log but does not vote, campaign, or count
+	// towards a majority, so a new node can catch up without affecting availability.
+	Learner bool
 }
 
 // ApplyMsg is delivered, in order, to the state machine. It is either a committed
@@ -117,6 +120,8 @@ type Status struct {
 	// LogEntries is how many entries it still holds in memory after that point.
 	SnapshotIndex int
 	LogEntries    int
-	// Members are the IDs of the voting members this node currently uses.
-	Members []int
+	// Members are the IDs of the voting members this node currently uses; Learners are the
+	// non-voting ones that it replicates to.
+	Members  []int
+	Learners []int
 }

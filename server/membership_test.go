@@ -2,6 +2,7 @@ package server_test
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"testing"
 	"time"
@@ -111,7 +112,7 @@ func TestLinearizableUnderMembershipChanges(t *testing.T) {
 				next++
 				c.joining[id] = true
 				c.start(id)
-				err := c.change(4*time.Second, func(ctx context.Context, s *server.Server) error {
+				err := c.change(10*time.Second, func(ctx context.Context, s *server.Server) error {
 					return s.AddServer(ctx, id, "")
 				})
 				if err == nil {
@@ -198,5 +199,38 @@ func waitMembersConverged(t *testing.T, c *kvCluster, ids []int) {
 			t.Fatalf("the members %v did not converge", ids)
 		}
 		time.Sleep(30 * time.Millisecond)
+	}
+}
+
+// AddServer returns only once the new node is a voter that has caught up: it first joins as a
+// learner and is promoted after it has received (here, mostly by snapshot) the data.
+func TestAddServerWaitsForTheNewNodeToCatchUp(t *testing.T) {
+	c := newKVMemberCluster(t, 3, 4, 10)
+	deadline := ctx(t, 60*time.Second)
+	cl := c.clerk(1)
+	const keys = 200
+	for i := 0; i < keys; i++ {
+		if err := cl.Put(deadline, fmt.Sprintf("k%03d", i), "v"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c.net.SetDelay(10*time.Millisecond, 20*time.Millisecond) // catching up now takes visible time
+	c.joining[3] = true
+	c.start(3)
+	if err := c.change(30*time.Second, func(ctx context.Context, s *server.Server) error {
+		return s.AddServer(ctx, 3, "")
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Promotion waited for the node to trail by at most a few entries, so it already has nearly
+	// everything now, without any further waiting.
+	if got := len(c.servers[3].Store().Data()); got < keys-10 {
+		t.Fatalf("the new node was made a voter with only %d of %d keys", got, keys)
+	}
+	st := c.servers[3].Node().Status()
+	if len(st.Members) != 4 || len(st.Learners) != 0 {
+		t.Fatalf("the new node sees voters %v and learners %v, want 4 voters", st.Members, st.Learners)
 	}
 }
