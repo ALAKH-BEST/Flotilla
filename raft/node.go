@@ -97,6 +97,10 @@ type Node struct {
 	// lastContact is when each peer last answered the leader in its term. A leader that cannot
 	// reach a majority steps down instead of staying leader in name only.
 	lastContact map[int]time.Time
+	// lastLeaderContact is when this node last heard from a leader that was valid for its term.
+	// epoch counts resets of the election timer, so a pre-vote round can tell it went stale.
+	lastLeaderContact time.Time
+	epoch             int
 
 	started  bool
 	stopped  bool
@@ -329,7 +333,7 @@ func (n *Node) tick(now time.Time) {
 			n.resetElectionDeadline() // not (or no longer) a voter: never campaign
 			return
 		}
-		n.startElection()
+		n.startPreVote()
 	}
 }
 
@@ -406,6 +410,7 @@ func (n *Node) snapshotMsg() *ApplyMsg {
 }
 
 func (n *Node) resetElectionDeadline() {
+	n.epoch++
 	span := n.cfg.ElectionTimeoutMax - n.cfg.ElectionTimeoutMin
 	n.electionDeadline = time.Now().Add(n.cfg.ElectionTimeoutMin + time.Duration(n.rng.Int63n(int64(span))))
 }

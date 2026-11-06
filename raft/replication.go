@@ -1,5 +1,7 @@
 package raft
 
+import "time"
+
 // broadcastAppendEntries sends entries (or a heartbeat) to every follower (the lock must be held).
 func (n *Node) broadcastAppendEntries() {
 	for _, m := range n.members {
@@ -165,6 +167,7 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply 
 	// A valid leader for this term: follow it (this also turns a candidate back into a follower).
 	n.becomeFollower(args.Term)
 	n.leaderID = args.LeaderID
+	n.lastLeaderContact = time.Now()
 	n.resetElectionDeadline()
 
 	reply := &AppendEntriesReply{Term: n.currentTerm}
@@ -236,6 +239,7 @@ func (n *Node) HandleInstallSnapshot(args *InstallSnapshotArgs) *InstallSnapshot
 	}
 	n.becomeFollower(args.Term)
 	n.leaderID = args.LeaderID
+	n.lastLeaderContact = time.Now()
 	n.resetElectionDeadline()
 
 	reply := &InstallSnapshotReply{Term: n.currentTerm}

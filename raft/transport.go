@@ -5,6 +5,7 @@ package raft
 // that by trying again later.
 type Transport interface {
 	RequestVote(to int, args *RequestVoteArgs) (*RequestVoteReply, error)
+	PreVote(to int, args *PreVoteArgs) (*PreVoteReply, error)
 	AppendEntries(to int, args *AppendEntriesArgs) (*AppendEntriesReply, error)
 	InstallSnapshot(to int, args *InstallSnapshotArgs) (*InstallSnapshotReply, error)
 }
@@ -12,6 +13,7 @@ type Transport interface {
 // Handler is the receiving side of the RPCs. *Node implements it.
 type Handler interface {
 	HandleRequestVote(args *RequestVoteArgs) *RequestVoteReply
+	HandlePreVote(args *PreVoteArgs) *PreVoteReply
 	HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply
 	HandleInstallSnapshot(args *InstallSnapshotArgs) *InstallSnapshotReply
 }

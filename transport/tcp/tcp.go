@@ -146,6 +146,14 @@ func (t *Transport) RequestVote(to int, args *raft.RequestVoteArgs) (*raft.Reque
 	return reply, nil
 }
 
+func (t *Transport) PreVote(to int, args *raft.PreVoteArgs) (*raft.PreVoteReply, error) {
+	reply := new(raft.PreVoteReply)
+	if err := t.call(to, "Raft.PreVote", args, reply, t.CallTimeout); err != nil {
+		return nil, err
+	}
+	return reply, nil
+}
+
 func (t *Transport) AppendEntries(to int, args *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
 	reply := new(raft.AppendEntriesReply)
 	if err := t.call(to, "Raft.AppendEntries", args, reply, t.CallTimeout); err != nil {
@@ -167,6 +175,11 @@ type service struct{ h raft.Handler }
 
 func (s *service) RequestVote(args *raft.RequestVoteArgs, reply *raft.RequestVoteReply) error {
 	*reply = *s.h.HandleRequestVote(args)
+	return nil
+}
+
+func (s *service) PreVote(args *raft.PreVoteArgs, reply *raft.PreVoteReply) error {
+	*reply = *s.h.HandlePreVote(args)
 	return nil
 }
 

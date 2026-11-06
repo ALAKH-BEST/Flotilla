@@ -114,6 +114,12 @@ func (e *endpoint) RequestVote(to int, args *raft.RequestVoteArgs) (*raft.Reques
 	return reply, err
 }
 
+func (e *endpoint) PreVote(to int, args *raft.PreVoteArgs) (*raft.PreVoteReply, error) {
+	var reply *raft.PreVoteReply
+	err := e.net.deliver(e.from, to, func(h raft.Handler) { reply = h.HandlePreVote(args) })
+	return reply, err
+}
+
 func (e *endpoint) AppendEntries(to int, args *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
 	var reply *raft.AppendEntriesReply
 	err := e.net.deliver(e.from, to, func(h raft.Handler) { reply = h.HandleAppendEntries(args) })

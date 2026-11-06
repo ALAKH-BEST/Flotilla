@@ -52,6 +52,20 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+// PreVoteArgs asks whether the receiver would vote for the candidate in an election for Term (one
+// more than the candidate's current term). Nothing changes on either side unless a majority says yes.
+type PreVoteArgs struct {
+	Term         int
+	CandidateID  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type PreVoteReply struct {
+	Term        int
+	VoteGranted bool
+}
+
 type AppendEntriesArgs struct {
 	Term         int
 	LeaderID     int

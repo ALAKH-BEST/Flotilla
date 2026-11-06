@@ -127,6 +127,10 @@ func (s *Server) HandleRequestVote(args *raft.RequestVoteArgs) *raft.RequestVote
 	return s.node.HandleRequestVote(args)
 }
 
+func (s *Server) HandlePreVote(args *raft.PreVoteArgs) *raft.PreVoteReply {
+	return s.node.HandlePreVote(args)
+}
+
 func (s *Server) HandleAppendEntries(args *raft.AppendEntriesArgs) *raft.AppendEntriesReply {
 	return s.node.HandleAppendEntries(args)
 }

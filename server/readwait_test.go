@@ -15,6 +15,10 @@ func (noTransport) RequestVote(int, *raft.RequestVoteArgs) (*raft.RequestVoteRep
 	return nil, errors.New("no peers")
 }
 
+func (noTransport) PreVote(int, *raft.PreVoteArgs) (*raft.PreVoteReply, error) {
+	return nil, errors.New("no peers")
+}
+
 func (noTransport) AppendEntries(int, *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
 	return nil, errors.New("no peers")
 }

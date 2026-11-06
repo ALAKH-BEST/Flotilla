@@ -127,6 +127,7 @@ The cluster tests run real nodes over `simnet` and check these cases:
 - a leader removes itself and the rest carry on
 - a second change is refused while one is uncommitted, and the last member cannot be removed
 - a membership entry that never committed is undone when its leader is replaced
+- a cut-off follower does not raise its term, and neither it nor a returning ex-leader forces an election; pre-vote refusal rules
 - a leader cut off from a majority steps down, a healthy one does not, and a new leader gets time to hear back on a slow network
 - a learner does not count towards a majority and never campaigns, and a learner can be promoted or removed
 - adding a server waits for the new node to catch up before promoting it
@@ -146,6 +147,10 @@ Every applied entry is also compared across replicas, and the test fails if two 
 - A snapshot, its index and term, and the log after it are saved in one write, so they cannot disagree after a crash.
 - A follower that is behind the leader's snapshot receives it in an `InstallSnapshot` RPC, keeps any entries after it that match, and passes it to the state machine before later entries. The snapshot travels in one message; very large ones would need chunking.
 
+### Pre-vote
+
+Before a node raises its term and campaigns, it asks the voters whether they would vote for it, with a `PreVote` RPC that changes nothing on either side. A voter says no while it still hears from a leader, and also when the candidate's log is behind or its prospective term is not ahead. Only if a majority says yes does the node start a real election. A node that lost its own connection therefore cannot run up its term, and its return, or the return of a leader that stepped down, does not force a new election. A pre-vote round that was overtaken by a heartbeat or another vote is dropped.
+
 ### Check-quorum
 
 A leader records when each voter last answered it. If a majority of voters (itself included) has not answered within an election timeout, it steps down. Without this, a leader cut off from the cluster stays leader in name: it cannot commit or confirm a read, and every client that reaches it waits out a timeout. With it, such a node answers "not leader" and clients move on at once. A newly elected leader gets a full timeout to hear back first.
@@ -163,4 +168,3 @@ A leader records when each voter last answered it. If a majority of voters (itse
 ## Not done
 
 - Chunked snapshot transfer, and removing a node that is unreachable when its removal is replicated.
-- Pre-vote. A node that was cut off keeps raising its term while it campaigns, and forces an extra election when it comes back.

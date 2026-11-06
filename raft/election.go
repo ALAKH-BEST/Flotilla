@@ -2,6 +2,81 @@ package raft
 
 import "time"
 
+// startPreVote asks a majority of the voters whether they would vote for this node, without
+// changing the term or any vote, and starts a real election only if they would. A node that was
+// cut off from a healthy cluster is turned down, so it does not run up its term and force
+// an election when it comes back (the lock must be held).
+func (n *Node) startPreVote() {
+	n.resetElectionDeadline() // if no majority says yes, try again after a fresh timeout
+	epoch := n.epoch
+	args := PreVoteArgs{
+		Term:         n.currentTerm + 1,
+		CandidateID:  n.cfg.ID,
+		LastLogIndex: n.lastLogIndex(),
+		LastLogTerm:  n.lastLogTerm(),
+	}
+	voters := n.voters()
+	granted := 1 // ourselves
+	if granted*2 > len(voters) {
+		n.startElection()
+		return
+	}
+	for _, m := range voters {
+		peer := m.ID
+		if peer == n.cfg.ID {
+			continue
+		}
+		go func(peer int) {
+			reply, err := n.cfg.Transport.PreVote(peer, &args)
+			if err != nil {
+				return
+			}
+			n.mu.Lock()
+			defer n.mu.Unlock()
+			// Anything that reset the election timer since (a leader's heartbeat, a vote we
+			// granted, a real election) makes this round stale.
+			if n.stopped || n.epoch != epoch || n.role == Leader {
+				return
+			}
+			if reply.Term > n.currentTerm {
+				n.becomeFollower(reply.Term)
+				n.resetElectionDeadline()
+				return
+			}
+			if reply.VoteGranted {
+				granted++
+				if granted*2 > len(voters) {
+					n.startElection()
+				}
+			}
+		}(peer)
+	}
+}
+
+// HandlePreVote answers whether this node would vote for the candidate. It changes nothing.
+// It says no while it is still hearing from a leader, which is what keeps a node that merely lost
+// its own connection from unseating a leader everyone else can reach.
+func (n *Node) HandlePreVote(args *PreVoteArgs) *PreVoteReply {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	no := &PreVoteReply{Term: n.currentTerm}
+	if n.stopped || args.Term <= n.currentTerm {
+		return no
+	}
+	if len(n.members) > 0 && !n.isVoter(args.CandidateID) {
+		return no
+	}
+	if n.role == Leader || time.Since(n.lastLeaderContact) < n.cfg.ElectionTimeoutMin {
+		return no
+	}
+	upToDate := args.LastLogTerm > n.lastLogTerm() ||
+		(args.LastLogTerm == n.lastLogTerm() && args.LastLogIndex >= n.lastLogIndex())
+	if !upToDate {
+		return no
+	}
+	return &PreVoteReply{Term: n.currentTerm, VoteGranted: true}
+}
+
 // startElection begins a new term as a candidate (the lock must be held).
 func (n *Node) startElection() {
 	n.currentTerm++
