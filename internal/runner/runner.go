@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ALAKH-BEST/flotilla/raft"
@@ -75,6 +76,7 @@ type Runner struct {
 	httpSrv   *http.Server
 	raftAddr  string
 	httpAddr  string
+	stopOnce  sync.Once
 }
 
 // Start runs a node until Stop is called.
@@ -125,6 +127,7 @@ func Start(cfg Config) (*Runner, error) {
 	if cfg.Join {
 		members = nil
 	}
+	var runnerRef atomic.Pointer[Runner] // set once the runner exists, for callbacks that need it
 	srv, err := server.New(server.Config{
 		Raft: raft.Config{
 			ID:        cfg.ID,
@@ -134,6 +137,16 @@ func Start(cfg Config) (*Runner, error) {
 			Storage:   storage,
 			// Members added later carry their addresses with them, so every node learns how to
 			// reach them from the log itself.
+			// A node that has been removed from the cluster has nothing left to do, so it shuts
+			// down. The pause lets it answer the leader's last message first, which is how the
+			// leader learns that it has been told.
+			OnRemoved: func() {
+				time.AfterFunc(removedStopDelay, func() {
+					if self := runnerRef.Load(); self != nil {
+						self.Stop()
+					}
+				})
+			},
 			OnMembership: func(ms []raft.Member) {
 				for _, m := range ms {
 					if p, err := parseAddr(m.Addr); err == nil {
@@ -166,6 +179,7 @@ func Start(cfg Config) (*Runner, error) {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() { _ = r.httpSrv.Serve(httpListener) }()
+	runnerRef.Store(r)
 	srv.Start()
 	return r, nil
 }
@@ -177,14 +191,19 @@ func (r *Runner) Server() *server.Server { return r.srv }
 func (r *Runner) RaftAddr() string { return r.raftAddr }
 func (r *Runner) HTTPAddr() string { return r.httpAddr }
 
-// Stop shuts the node down.
+// removedStopDelay is how long a removed node keeps running after it learns of its removal.
+const removedStopDelay = time.Second
+
+// Stop shuts the node down. It is safe to call more than once.
 func (r *Runner) Stop() {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = r.httpSrv.Shutdown(ctx)
-	r.stopRaft()
-	r.srv.Stop()
-	r.transport.Close()
+	r.stopOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = r.httpSrv.Shutdown(ctx)
+		r.stopRaft()
+		r.srv.Stop()
+		r.transport.Close()
+	})
 }
 
 // formatAddr and parseAddr turn a Peer into the opaque address string that travels with the

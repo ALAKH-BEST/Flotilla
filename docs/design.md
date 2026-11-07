@@ -22,7 +22,8 @@ How Flotilla works, and how it is tested. Section numbers refer to the [Raft pap
 ## Snapshots
 
 - The state machine decides when to compact. A snapshot, its index and term, the membership at that index, and the log after it are saved in one write, so they cannot disagree after a crash.
-- A follower that is behind the leader's snapshot receives it in an `InstallSnapshot` RPC, keeps any entries after it that match, and passes it to the state machine before later entries. The snapshot travels in one message; very large ones would need chunking.
+- A follower that is behind the leader's snapshot receives it in `InstallSnapshot` RPCs, keeps any entries after it that match, and passes it to the state machine before later entries.
+- The snapshot is sent in chunks (`SnapshotChunkSize`, 64 KiB by default). The follower buffers them and uses nothing until the last one arrives. Each reply says how many bytes the follower holds, so a lost, duplicated or out-of-order chunk is repaired by resuming from that offset, and an interrupted transfer continues instead of starting over. A transfer belongs to one leader, term and snapshot; chunks of anything else restart it. The leader runs one transfer per follower at a time, so heartbeats do not start competing ones.
 
 ## Client API
 
@@ -35,7 +36,8 @@ How Flotilla works, and how it is tested. Section numbers refer to the [Raft pap
 - The membership is an entry in the log, and a node uses the newest one it has as soon as it is appended, committed or not. If that entry is truncated, the node goes back to the previous membership. Snapshots and `InstallSnapshot` carry the membership, so compaction cannot lose it.
 - A leader starts a change only after it has committed an entry of its own term, and only when no earlier change is uncommitted.
 - A leader can remove itself: it stays leader, not counting itself, until the change commits, then steps down.
-- A node ignores a vote request from a server that is not a voter in its membership, without adopting its term. A removed server that never heard of its removal therefore cannot disrupt the cluster with higher terms. The leader stops replicating to a removed server as soon as the entry is appended, so that server may never learn it was removed; stop it.
+- A node ignores a vote request from a server that is not a voter in its membership, without adopting its term. A removed server that never heard of its removal therefore cannot disrupt the cluster with higher terms. 
+- A removed server finds out. The leader keeps offering the log to each server it removed, now and then (every ten heartbeats), until one confirms it holds the removal and knows it is committed. That works for a server that was cut off at the time and comes back later, including after the others compacted past the removal, because the snapshot carries the membership. A node counts itself removed only when a *committed* membership change drops it from the committed membership, never because of an entry that could still be undone. It then calls `Config.OnRemoved`, and the server process stops itself a second later. A new leader works out whom to keep telling from the membership entries still in its log; a removal already compacted into a snapshot is forgotten if the leader changes, so such a server is left running (harmless, since it cannot campaign, but stop it by hand).
 - A new node starts with no members (`-join`), so it cannot elect itself leader of a cluster of one.
 - A new node is added as a **learner**: it receives the log and snapshots but does not vote, campaign, or count towards commits or read confirmation. Only promoting it changes the voters, one server at a time. `Server.AddServer` waits until the learner trails the commit index by a few entries before promoting it; this protects availability, not safety. If it fails part way the node stays a learner and `flotilla add` can be run again.
 - Every node learns a new node's address from the log, so a node restarted from its data directory needs no address list.
@@ -50,6 +52,8 @@ How Flotilla works, and how it is tested. Section numbers refer to the [Raft pap
 - progress under 15% message loss and random delay, with concurrent clients
 - snapshots keep the log short while every replica ends with the same data, a follower behind the compacted log catches up from the snapshot, and nodes restore from it after a restart
 - the cluster grows and shrinks, a leader removes itself, removed nodes still running do not disturb it, a second change is refused while one is uncommitted, and an uncommitted change is undone when its leader is replaced
+- a snapshot is split into chunks and still arrives whole over a lossy, delayed network; the receiver handles duplicated, missing, stale and mixed chunks, and installs nothing before the last one
+- a removed server learns of it whether it was cut off, reachable, the leader, behind a compacted log, or the leader changed meanwhile; an uncommitted removal and a server being added are never mistaken for one; the leader stops contacting a server that knows
 - the membership survives compaction and restarts, including a node that joins after the log was compacted past its entry
 - a learner does not count towards a majority and never campaigns; adding a server waits for it to catch up
 - a cut-off follower does not raise its term and a returning node does not force an election; a leader cut off from a majority steps down and a healthy one does not
@@ -63,5 +67,4 @@ Every applied entry is also compared across replicas, and the test fails if two 
 
 ## Not done
 
-- Chunked snapshot transfer.
-- Removing a node that is unreachable when its removal is replicated: it keeps running until stopped by hand.
+- A removed server that stays unreachable across a leader change after the removal was compacted into a snapshot is never told (see membership changes).

@@ -3,6 +3,7 @@ package raft
 import (
 	"errors"
 	"sort"
+	"time"
 )
 
 var (
@@ -235,8 +236,101 @@ func (n *Node) proposeMembers(members []Member) (index, term int, err error) {
 	n.persist()
 	index = n.lastLogIndex()
 	n.matchIndex[n.cfg.ID] = index
+	old := n.members
 	n.refreshMembers() // the new membership applies from the moment it is in the log
+	for _, m := range old {
+		if !hasMember(members, m.ID) && m.ID != n.cfg.ID {
+			n.departing[m.ID] = &departure{index: index}
+		}
+	}
+	for _, m := range members {
+		delete(n.departing, m.ID)
+	}
 	n.broadcastAppendEntries()
 	n.advanceCommit()
 	return index, n.currentTerm, nil
+}
+
+// departure tracks a removed server the leader is still trying to tell about its removal.
+type departure struct {
+	index    int       // the log index of the entry that removed it
+	nextTry  time.Time // departing servers are tried far less often than members
+	inflight bool
+}
+
+// departRetry is how many heartbeat intervals pass between attempts to reach a removed server.
+const departRetry = 10
+
+func hasMember(ms []Member, id int) bool {
+	for _, m := range ms {
+		if m.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// noteRemoval records that this node has been removed if the committed membership went from
+// including it to excluding it. Only committed membership counts: an appended entry can still
+// be undone (the lock must be held).
+func (n *Node) noteRemoval(before, after []Member) {
+	if n.removed || !hasMember(before, n.cfg.ID) || hasMember(after, n.cfg.ID) {
+		return
+	}
+	n.removed = true
+	if n.cfg.OnRemoved != nil {
+		go n.cfg.OnRemoved()
+	}
+}
+
+// noteCommit runs after the commit index moved up from old.
+func (n *Node) noteCommit(old int) {
+	if n.commitIndex > old {
+		n.noteRemoval(n.membersAt(old), n.membersAt(n.commitIndex))
+	}
+}
+
+// rebuildDeparting works out, from the log, which removed servers a new leader should still tell:
+// every server that a membership entry in the log removed and a later one did not bring back.
+// Removals compacted into a snapshot are not remembered.
+func (n *Node) rebuildDeparting() {
+	n.departing = make(map[int]*departure)
+	prev := n.snapshotMembers
+	for i := n.snapshotIndex + 1; i <= n.lastLogIndex(); i++ {
+		cur := n.log[i-n.snapshotIndex].Members
+		if len(cur) == 0 {
+			continue
+		}
+		for _, m := range prev {
+			if !hasMember(cur, m.ID) {
+				n.departing[m.ID] = &departure{index: i}
+				n.nextIndex[m.ID] = n.lastLogIndex() + 1
+				n.matchIndex[m.ID] = 0
+			}
+		}
+		for _, m := range cur {
+			delete(n.departing, m.ID)
+		}
+		prev = cur
+	}
+}
+
+// notifyDeparting offers the log to removed servers that have not confirmed their removal yet.
+func (n *Node) notifyDeparting() {
+	now := time.Now()
+	for id, d := range n.departing {
+		if d.inflight || now.Before(d.nextTry) {
+			continue
+		}
+		d.inflight = true
+		d.nextTry = now.Add(departRetry * n.cfg.HeartbeatInterval)
+		go func(id int) {
+			n.replicateTo(id)
+			n.mu.Lock()
+			if d := n.departing[id]; d != nil {
+				d.inflight = false
+			}
+			n.mu.Unlock()
+		}(id)
+	}
 }

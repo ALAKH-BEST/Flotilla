@@ -146,6 +146,8 @@ func (n *Node) becomeLeader() {
 		n.lastContact[m.ID] = time.Now() // a new leader gets a full timeout to hear from a majority
 	}
 	n.matchIndex[n.cfg.ID] = last
+	n.snapOffset = make(map[int]snapProgress)
+	n.rebuildDeparting()
 	n.nextHeartbeat = time.Now().Add(n.cfg.HeartbeatInterval)
 	n.broadcastAppendEntries()
 	n.advanceCommit()

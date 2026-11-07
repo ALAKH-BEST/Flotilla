@@ -90,14 +90,21 @@ type InstallSnapshotArgs struct {
 	LeaderID          int
 	LastIncludedIndex int
 	LastIncludedTerm  int
-	// Data is the whole snapshot in one message. Large snapshots would need chunking.
-	Data []byte
+	// Data is one chunk of the snapshot, starting Offset bytes in. Done marks the last chunk.
+	Offset int
+	Data   []byte
+	Done   bool
 	// Members is the cluster membership as of LastIncludedIndex.
 	Members []Member
 }
 
 type InstallSnapshotReply struct {
 	Term int
+	// NextOffset is how many bytes of this snapshot the receiver now holds, so the leader sends
+	// the next chunk from there (this also repairs a lost, duplicated or reordered chunk).
+	NextOffset int
+	// Installed is set once the receiver has the whole snapshot, or no longer needs it.
+	Installed bool
 }
 
 // Role is the part of the protocol a node is currently playing.
@@ -138,4 +145,6 @@ type Status struct {
 	// non-voting ones that it replicates to.
 	Members  []int
 	Learners []int
+	// Removed is set once a committed membership change has removed this node.
+	Removed bool
 }

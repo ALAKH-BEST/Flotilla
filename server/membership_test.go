@@ -59,7 +59,7 @@ func (c *kvCluster) change(timeout time.Duration, do func(context.Context, *serv
 }
 
 // Clients hammer the cluster while servers are added and removed (the leader included) at random,
-// in between isolations and crashes. Removed servers keep running and never hear of their removal.
+// in between isolations and crashes. Removed servers are left running (the test never stops them).
 // Every operation is recorded and the whole history must be linearizable.
 func TestLinearizableUnderMembershipChanges(t *testing.T) {
 	const (
@@ -129,7 +129,7 @@ func TestLinearizableUnderMembershipChanges(t *testing.T) {
 				if err == nil {
 					removes++
 					if rng.Intn(2) == 0 {
-						c.crash(id) // otherwise it keeps running, unaware that it was removed
+						c.crash(id) // otherwise it keeps running after its removal
 					}
 				}
 			}

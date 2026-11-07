@@ -20,6 +20,7 @@ type cluster struct {
 	net       *simnet.Network
 	n         int
 	snapEvery int // take a snapshot every this many applied entries (0 = never)
+	chunk     int // snapshot chunk size in bytes (0 = the default)
 	storages  []*raft.MemoryStorage
 	nodes     []*raft.Node
 	stores    []*kv.Store
@@ -32,6 +33,50 @@ type cluster struct {
 	committed map[int]raft.ApplyMsg // first entry seen at each index, to compare replicas
 	lastIndex []int                 // per node: highest index applied (or covered by an installed snapshot)
 	installed []int                 // per node: snapshots handed to its state machine
+	chunks    snapshotChunks        // every snapshot chunk the leaders sent
+	appends   map[int]int           // AppendEntries messages sent to each node
+	removed   map[int]int           // per node: how many times OnRemoved was called
+}
+
+// snapshotChunks records the InstallSnapshot messages sent in a cluster.
+type snapshotChunks struct {
+	sent, restarts, largest int            // chunks sent, chunks with offset 0, and the biggest chunk's size
+	inflight, mostInflight  map[[2]int]int // per (leader, follower): transfers in progress now, and at most
+}
+
+// recordingTransport wraps a node's transport to record the snapshot chunks it sends.
+type recordingTransport struct {
+	raft.Transport
+	c *cluster
+}
+
+func (r recordingTransport) AppendEntries(to int, args *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
+	r.c.mu.Lock()
+	r.c.appends[to]++
+	r.c.mu.Unlock()
+	return r.Transport.AppendEntries(to, args)
+}
+
+func (r recordingTransport) InstallSnapshot(to int, args *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
+	r.c.mu.Lock()
+	r.c.chunks.sent++
+	if args.Offset == 0 {
+		r.c.chunks.restarts++
+	}
+	r.c.chunks.largest = max(r.c.chunks.largest, len(args.Data))
+	if r.c.chunks.inflight == nil {
+		r.c.chunks.inflight, r.c.chunks.mostInflight = map[[2]int]int{}, map[[2]int]int{}
+	}
+	pair := [2]int{args.LeaderID, to}
+	r.c.chunks.inflight[pair]++
+	r.c.chunks.mostInflight[pair] = max(r.c.chunks.mostInflight[pair], r.c.chunks.inflight[pair])
+	r.c.mu.Unlock()
+	defer func() {
+		r.c.mu.Lock()
+		r.c.chunks.inflight[pair]--
+		r.c.mu.Unlock()
+	}()
+	return r.Transport.InstallSnapshot(to, args)
 }
 
 func newCluster(t *testing.T, n int) *cluster { return newSnapshotCluster(t, n, 0) }
@@ -61,6 +106,8 @@ func newMemberCluster(t *testing.T, initial, total, snapEvery int) *cluster {
 		cut:       make([]bool, n),
 		committed: make(map[int]raft.ApplyMsg),
 		lastIndex: make([]int, n),
+		appends:   make(map[int]int),
+		removed:   make(map[int]int),
 	}
 	for i := 0; i < n; i++ {
 		c.storages[i] = raft.NewMemoryStorage()
@@ -91,10 +138,17 @@ func (c *cluster) start(i int) {
 		ID:        i,
 		Peers:     peers,
 		Join:      c.joining[i],
-		Transport: c.net.Transport(i),
+		Transport: recordingTransport{c.net.Transport(i), c},
 		Storage:   c.storages[i],
 		ApplyCh:   applyCh,
 		Seed:      int64(i + 1),
+
+		SnapshotChunkSize: c.chunk,
+		OnRemoved: func() {
+			c.mu.Lock()
+			c.removed[i]++
+			c.mu.Unlock()
+		},
 	})
 	if err != nil {
 		c.t.Fatalf("node %d: %v", i, err)

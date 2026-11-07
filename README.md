@@ -100,4 +100,4 @@ How it works and what is tested in detail: [docs/design.md](docs/design.md).
 
 ## Not done
 
-Chunked snapshot transfer, and removing a node that is unreachable when its removal is replicated.
+A removed node that stays unreachable across a leader change, after its removal was compacted into a snapshot, is never told. Details in the design notes.

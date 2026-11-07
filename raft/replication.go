@@ -9,13 +9,14 @@ func (n *Node) broadcastAppendEntries() {
 			go n.replicateTo(m.ID)
 		}
 	}
+	n.notifyDeparting()
 }
 
 // replicateTo brings one follower up to date: with log entries, or with the snapshot
 // when the entries it needs have already been compacted away.
 func (n *Node) replicateTo(peer int) {
 	n.mu.Lock()
-	if n.stopped || n.role != Leader || !n.isMember(peer) {
+	if n.stopped || n.role != Leader || (!n.isMember(peer) && n.departing[peer] == nil) {
 		n.mu.Unlock()
 		return
 	}
@@ -61,6 +62,9 @@ func (n *Node) replicateTo(peer int) {
 		if n.nextIndex[peer] < n.matchIndex[peer]+1 {
 			n.nextIndex[peer] = n.matchIndex[peer] + 1
 		}
+		if d := n.departing[peer]; d != nil && match >= d.index && args.LeaderCommit >= d.index {
+			delete(n.departing, peer) // it has the removal and knows it is committed
+		}
 		n.advanceCommit()
 		return
 	}
@@ -91,45 +95,93 @@ func (n *Node) replicateTo(peer int) {
 	go n.replicateTo(peer)
 }
 
-// sendSnapshot sends the snapshot to a follower that is behind it. It is called with
-// the lock held and releases it.
+// sendSnapshot streams the snapshot to a follower that is behind it, one chunk at a time. It is
+// called with the lock held and releases it. Only one transfer per follower runs at once; each
+// chunk's reply says where to continue, and every reply counts as the follower answering us.
 func (n *Node) sendSnapshot(peer int) {
+	if _, busy := n.sendingSnap[peer]; busy {
+		n.mu.Unlock()
+		return
+	}
 	n.sendSeq++
-	seq := n.sendSeq
-	args := &InstallSnapshotArgs{
-		Term:              n.currentTerm,
-		LeaderID:          n.cfg.ID,
-		LastIncludedIndex: n.snapshotIndex,
-		LastIncludedTerm:  n.snapshotTerm,
-		Data:              n.snapshot,
-		Members:           n.snapshotMembers,
+	owner := n.sendSeq
+	n.sendingSnap[peer] = owner
+	term := n.currentTerm
+	index, lastTerm := n.snapshotIndex, n.snapshotTerm
+	data, members := n.snapshot, n.snapshotMembers // never modified once set
+	offset := 0
+	if p := n.snapOffset[peer]; p.index == index && p.term == lastTerm {
+		offset = min(p.offset, len(data)) // resume an interrupted transfer
 	}
 	n.mu.Unlock()
 
-	reply, err := n.cfg.Transport.InstallSnapshot(peer, args)
-	if err != nil {
-		return
+	finish := func() { // the lock must be held
+		if n.sendingSnap[peer] == owner {
+			delete(n.sendingSnap, peer)
+		}
 	}
+	for {
+		end := min(offset+n.cfg.SnapshotChunkSize, len(data))
+		args := &InstallSnapshotArgs{
+			Term:              term,
+			LeaderID:          n.cfg.ID,
+			LastIncludedIndex: index,
+			LastIncludedTerm:  lastTerm,
+			Offset:            offset,
+			Data:              data[offset:end],
+			Done:              end == len(data),
+			Members:           members,
+		}
+		n.mu.Lock()
+		n.sendSeq++
+		seq := n.sendSeq
+		n.mu.Unlock()
 
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.stopped || n.currentTerm != args.Term || n.role != Leader {
-		return
+		reply, err := n.cfg.Transport.InstallSnapshot(peer, args)
+
+		n.mu.Lock()
+		if err != nil || n.stopped || n.currentTerm != term || n.role != Leader {
+			if err != nil {
+				n.snapOffset[peer] = snapProgress{index, lastTerm, offset}
+			}
+			finish()
+			n.mu.Unlock()
+			return // lost; the next heartbeat starts again, and the follower says where it was
+		}
+		if reply.Term > n.currentTerm {
+			finish()
+			n.becomeFollower(reply.Term)
+			n.resetElectionDeadline()
+			n.mu.Unlock()
+			return
+		}
+		n.acked(peer, seq)
+		if reply.Installed {
+			if index > n.matchIndex[peer] {
+				n.matchIndex[peer] = index
+			}
+			if n.nextIndex[peer] < n.matchIndex[peer]+1 {
+				n.nextIndex[peer] = n.matchIndex[peer] + 1
+			}
+			finish()
+			if d := n.departing[peer]; d != nil && index >= d.index {
+				delete(n.departing, peer) // the snapshot told it it is gone
+			}
+			n.advanceCommit()
+			n.mu.Unlock()
+			go n.replicateTo(peer) // send whatever follows the snapshot
+			return
+		}
+		if n.snapshotIndex != index || (!n.isMember(peer) && n.departing[peer] == nil) {
+			finish()
+			n.mu.Unlock()
+			go n.replicateTo(peer) // our snapshot moved on (or the peer left): start over
+			return
+		}
+		offset = max(0, min(reply.NextOffset, len(data)))
+		n.snapOffset[peer] = snapProgress{index, lastTerm, offset}
+		n.mu.Unlock()
 	}
-	if reply.Term > n.currentTerm {
-		n.becomeFollower(reply.Term)
-		n.resetElectionDeadline()
-		return
-	}
-	n.acked(peer, seq)
-	if args.LastIncludedIndex > n.matchIndex[peer] {
-		n.matchIndex[peer] = args.LastIncludedIndex
-	}
-	if n.nextIndex[peer] < n.matchIndex[peer]+1 {
-		n.nextIndex[peer] = n.matchIndex[peer] + 1
-	}
-	n.advanceCommit()
-	go n.replicateTo(peer) // send whatever follows the snapshot
 }
 
 // advanceCommit commits the highest entry of the current term stored on a majority (the lock must be held).
@@ -145,7 +197,9 @@ func (n *Node) advanceCommit() {
 			}
 		}
 		if n.isMajority(count) {
+			old := n.commitIndex
 			n.commitIndex = idx
+			n.noteCommit(old)
 			n.applyCond.Broadcast()
 			if !n.isVoter(n.cfg.ID) {
 				// The membership that dropped this leader has committed, so its job is done.
@@ -222,7 +276,9 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply 
 		lastNew := prev + len(entries)
 		// Never move the commit index backwards: a delayed message can carry an old view.
 		if newCommit := min(args.LeaderCommit, lastNew); newCommit > n.commitIndex {
+			old := n.commitIndex
 			n.commitIndex = newCommit
+			n.noteCommit(old)
 			n.applyCond.Broadcast()
 		}
 	}
@@ -230,7 +286,18 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply 
 	return reply
 }
 
-// HandleInstallSnapshot replaces this node's state with a snapshot from the leader.
+// snapProgress is how many bytes of one snapshot have been sent to a follower.
+type snapProgress struct{ index, term, offset int }
+
+// incomingSnapshot is a snapshot being received from a leader, a chunk at a time.
+type incomingSnapshot struct {
+	term, leader int // the transfer belongs to one leader in one term
+	index, last  int // LastIncludedIndex and LastIncludedTerm
+	data         []byte
+}
+
+// HandleInstallSnapshot receives a snapshot from the leader, chunk by chunk, and replaces this
+// node's state with it once the last chunk has arrived.
 func (n *Node) HandleInstallSnapshot(args *InstallSnapshotArgs) *InstallSnapshotReply {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -244,8 +311,35 @@ func (n *Node) HandleInstallSnapshot(args *InstallSnapshotArgs) *InstallSnapshot
 
 	reply := &InstallSnapshotReply{Term: n.currentTerm}
 	if args.LastIncludedIndex <= n.commitIndex {
-		return reply // we already have everything this snapshot covers
+		n.incoming = nil
+		reply.Installed = true // we already have everything this snapshot covers
+		return reply
 	}
+
+	// Chunks must arrive in order from the same transfer; anything else is answered with how much
+	// we hold, so the leader can carry on from there. Offset 0 always starts a transfer afresh.
+	in := n.incoming
+	if args.Offset == 0 {
+		in = &incomingSnapshot{term: args.Term, leader: args.LeaderID, index: args.LastIncludedIndex, last: args.LastIncludedTerm}
+		n.incoming = in
+	}
+	if in == nil || in.term != args.Term || in.leader != args.LeaderID ||
+		in.index != args.LastIncludedIndex || in.last != args.LastIncludedTerm {
+		n.incoming = nil
+		return reply // NextOffset 0: start from the beginning
+	}
+	if args.Offset != len(in.data) {
+		reply.NextOffset = len(in.data) // a duplicate or a gap
+		return reply
+	}
+	in.data = append(in.data, args.Data...)
+	reply.NextOffset = len(in.data)
+	if !args.Done {
+		return reply
+	}
+	n.incoming = nil
+
+	committedBefore := n.membersAt(n.commitIndex)
 
 	// Keep the entries after the snapshot if they agree with it; otherwise drop the whole log.
 	if args.LastIncludedIndex <= n.lastLogIndex() && n.termAt(args.LastIncludedIndex) == args.LastIncludedTerm {
@@ -258,12 +352,14 @@ func (n *Node) HandleInstallSnapshot(args *InstallSnapshotArgs) *InstallSnapshot
 	if len(args.Members) > 0 {
 		n.snapshotMembers = args.Members
 	}
-	n.snapshot = append([]byte(nil), args.Data...)
+	n.snapshot = in.data
+	n.noteRemoval(committedBefore, n.snapshotMembers)
 	n.commitIndex = args.LastIncludedIndex
 	n.lastApplied = args.LastIncludedIndex
 	n.pendingSnapshot = n.snapshotMsg()
 	n.refreshMembers()
 	n.persist()
 	n.applyCond.Broadcast()
+	reply.Installed = true
 	return reply
 }

@@ -30,6 +30,10 @@ type Config struct {
 	// changes (and once at Start). It runs with the node's lock held, so it must be quick
 	// and must not call back into the node.
 	OnMembership func([]Member)
+	// OnRemoved is called once, from its own goroutine, when this node learns that a committed
+	// membership change removed it from the cluster. The node then has nothing left to do: the
+	// caller should stop it.
+	OnRemoved func()
 
 	Transport Transport
 	Storage   Storage
@@ -41,6 +45,8 @@ type Config struct {
 	ElectionTimeoutMax time.Duration
 	HeartbeatInterval  time.Duration
 	TickInterval       time.Duration
+	// SnapshotChunkSize is the most snapshot bytes sent in one message (default 64 KiB).
+	SnapshotChunkSize int
 
 	// Seed for the election timeout jitter. Zero picks one from the clock and ID.
 	Seed int64
@@ -51,6 +57,7 @@ const (
 	defaultElectionTimeoutMax = 300 * time.Millisecond
 	defaultHeartbeatInterval  = 40 * time.Millisecond
 	defaultTickInterval       = 10 * time.Millisecond
+	defaultSnapshotChunkSize  = 64 << 10
 )
 
 // Node is one member of a Raft cluster.
@@ -82,6 +89,8 @@ type Node struct {
 	// pendingSnapshot is a snapshot waiting to be handed to the state machine, which
 	// must happen before any entry that follows it.
 	pendingSnapshot *ApplyMsg
+	// incoming holds a snapshot being received in chunks. Nothing in it is used until it is complete.
+	incoming *incomingSnapshot
 
 	electionDeadline time.Time
 	nextHeartbeat    time.Time
@@ -97,6 +106,17 @@ type Node struct {
 	// lastContact is when each peer last answered the leader in its term. A leader that cannot
 	// reach a majority steps down instead of staying leader in name only.
 	lastContact map[int]time.Time
+	// sendingSnap marks the peers a snapshot is being streamed to, so that heartbeats do not
+	// start a second, competing transfer. The value identifies the transfer that owns the mark.
+	sendingSnap map[int]int
+	// snapOffset remembers how far a transfer got, so one interrupted by a lost message resumes
+	// instead of starting over. The follower corrects it if it is wrong.
+	snapOffset map[int]snapProgress
+	// departing are servers that were removed and may not know it yet: the leader keeps offering
+	// them the log, now and then, until one confirms it has the removal committed.
+	departing map[int]*departure
+	// removed is set once a committed change has removed this node.
+	removed bool
 	// lastLeaderContact is when this node last heard from a leader that was valid for its term.
 	// epoch counts resets of the election timer, so a pre-vote round can tell it went stale.
 	lastLeaderContact time.Time
@@ -151,6 +171,9 @@ func New(cfg Config) (*Node, error) {
 	if cfg.TickInterval == 0 {
 		cfg.TickInterval = defaultTickInterval
 	}
+	if cfg.SnapshotChunkSize <= 0 {
+		cfg.SnapshotChunkSize = defaultSnapshotChunkSize
+	}
 	seed := cfg.Seed
 	if seed == 0 {
 		seed = time.Now().UnixNano() + int64(cfg.ID)*7919
@@ -167,6 +190,9 @@ func New(cfg Config) (*Node, error) {
 		ackSeq:     make(map[int]int),
 
 		lastContact: make(map[int]time.Time),
+		sendingSnap: make(map[int]int),
+		snapOffset:  make(map[int]snapProgress),
+		departing:   make(map[int]*departure),
 
 		snapshotMembers: bootstrap,
 		stopCh:          make(chan struct{}),
@@ -264,6 +290,7 @@ func (n *Node) Status() Status {
 		LogEntries:    len(n.log) - 1,
 		Members:       n.voterIDs(),
 		Learners:      n.learnerIDs(),
+		Removed:       n.removed,
 	}
 }
 

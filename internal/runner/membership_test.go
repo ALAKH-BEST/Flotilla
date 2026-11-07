@@ -125,7 +125,14 @@ func TestClusterGrowsAndShrinksOverTCP(t *testing.T) {
 	// Remove an original node. Writes keep working through the others, and the removed node can
 	// go away without the cluster missing it.
 	admin(t, all, http.MethodDelete, "/admin/members/0", "", http.StatusNoContent)
-	nodes[0].r.Stop()
+	waitFor(t, "the removed node to shut itself down", func() bool {
+		resp, err := http.Get("http://" + nodes[0].httpAddr + "/admin/members")
+		if err == nil {
+			resp.Body.Close()
+		}
+		return err != nil
+	})
+	nodes[0].r.Stop() // already stopped; stopping again is harmless
 	nodes[0].r = nil
 	rest := []string{nodes[1].httpAddr, nodes[2].httpAddr, n3.httpAddr}
 	retry(t, rest, http.MethodPut, "after-remove", "ok", http.StatusNoContent)

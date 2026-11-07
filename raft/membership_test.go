@@ -142,8 +142,8 @@ func TestGrowAndShrinkTheCluster(t *testing.T) {
 		t.Fatalf("data after growing: %v", data)
 	}
 
-	// Shrink back to three. The removed nodes keep running and never hear about it, which is the
-	// case that can disrupt a cluster: they time out and campaign with ever higher terms.
+	// Shrink back to three. The removed nodes keep running (this test never stops them), which is the
+	// case that can disrupt a cluster: they could time out and campaign with ever higher terms.
 	leader := c.checkOneLeader()
 	var removed []int
 	for i := 4; i >= 0 && len(removed) < 2; i-- {
@@ -478,5 +478,216 @@ func TestNewLeaderIsGivenTimeToHearFromAMajority(t *testing.T) {
 		if st := c.nodes[leader].Status(); st.Role != raft.Leader || st.Term != term {
 			t.Fatalf("the leader was unseated on a slow but healthy network: %+v (term was %d)", st, term)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// A removed server finds out that it was removed
+// ---------------------------------------------------------------------------
+
+func (c *cluster) removedCalls(i int) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.removed[i]
+}
+
+func (c *cluster) waitRemoved(i int) {
+	c.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !c.nodes[i].Status().Removed {
+		if time.Now().After(deadline) {
+			c.t.Fatalf("node %d never learned that it was removed", i)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func (c *cluster) sentAppends(i int) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.appends[i]
+}
+
+func (c *cluster) wantNotRemoved(ids ...int) {
+	c.t.Helper()
+	for _, i := range ids {
+		if c.nodes[i].Status().Removed || c.removedCalls(i) != 0 {
+			c.t.Fatalf("node %d believes it was removed but is a member", i)
+		}
+	}
+}
+
+// A server that is cut off when it is removed learns of it as soon as it can be reached again.
+func TestUnreachableServerLearnsItWasRemoved(t *testing.T) {
+	c := newMemberCluster(t, 5, 5, 0)
+	leader := c.checkOneLeader()
+	victim := (leader + 1) % 5
+	c.put("a", "1", 5)
+
+	c.isolate(victim)
+	c.remove(victim)
+	c.put("b", "2", 4)
+	time.Sleep(300 * time.Millisecond)
+	if c.nodes[victim].Status().Removed {
+		t.Fatal("it cannot know before it is reachable")
+	}
+
+	c.reconnect(victim)
+	c.waitRemoved(victim)
+	c.mu.Lock()
+	calls := c.removed[victim]
+	c.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("OnRemoved called %d times, want 1", calls)
+	}
+	for i := 0; i < 5; i++ {
+		if i != victim {
+			c.wantNotRemoved(i)
+		}
+	}
+	c.put("c", "3", 4)
+}
+
+// A server that was reachable all along is told too, which used to need stopping by hand.
+func TestReachableServerLearnsItWasRemoved(t *testing.T) {
+	c := newMemberCluster(t, 4, 4, 0)
+	leader := c.checkOneLeader()
+	victim := (leader + 2) % 4
+	c.remove(victim)
+	c.waitRemoved(victim)
+	c.wantNotRemoved(leader)
+}
+
+// The leader that removes itself is told as well, once the change commits.
+func TestRemovedLeaderLearnsItWasRemoved(t *testing.T) {
+	c := newMemberCluster(t, 3, 3, 0)
+	old := c.checkOneLeader()
+	c.remove(old)
+	c.waitRemoved(old)
+}
+
+// The others compact their logs well past the removal while the server is away, so it can only find
+// out through the snapshot that replaces what it missed.
+func TestUnreachableServerLearnsItWasRemovedFromASnapshot(t *testing.T) {
+	c := newMemberCluster(t, 3, 3, 5)
+	leader := c.checkOneLeader()
+	victim := (leader + 1) % 3
+	c.isolate(victim)
+	c.remove(victim)
+	removalAt := c.nodes[leader].Status().CommitIndex
+	for i := 0; i < 40; i++ {
+		c.put(fmt.Sprintf("k%d", i), "v", 2)
+	}
+	if got := c.nodes[leader].Status().SnapshotIndex; got <= removalAt {
+		t.Fatalf("the leader has compacted only to %d, the removal is at %d", got, removalAt)
+	}
+	c.reconnect(victim)
+	c.waitRemoved(victim)
+}
+
+// If the leader changes while the server is away, the new leader still tells it.
+func TestNewLeaderStillTellsARemovedServer(t *testing.T) {
+	c := newMemberCluster(t, 5, 5, 0)
+	leader := c.checkOneLeader()
+	victim := (leader + 1) % 5
+	c.isolate(victim)
+	c.remove(victim)
+	c.put("a", "1", 4)
+
+	c.crash(leader)
+	next := c.checkOneLeader()
+	if next == leader {
+		t.Fatal("the crashed node cannot be the leader")
+	}
+	c.put("b", "2", 3)
+	c.reconnect(victim)
+	c.waitRemoved(victim)
+}
+
+// A server being added, as a learner and then a voter, is never mistaken for a removed one.
+func TestAddedServerIsNeverMistakenForRemoved(t *testing.T) {
+	c := newMemberCluster(t, 3, 5, 5)
+	c.checkOneLeader()
+	for i := 0; i < 30; i++ {
+		c.put(fmt.Sprintf("k%d", i), "v", 3)
+	}
+	c.addLearner(3)
+	c.addLearner(4)
+	for _, id := range []int{3, 4} {
+		c.changeMembers(func(n *raft.Node) (int, int, error) { return n.PromoteLearner(id) })
+	}
+	c.put("after", "v", 5)
+	time.Sleep(500 * time.Millisecond)
+	c.wantNotRemoved(0, 1, 2, 3, 4)
+}
+
+// Once a removed server has confirmed, the leader stops contacting it.
+func TestLeaderStopsContactingAServerThatKnows(t *testing.T) {
+	c := newMemberCluster(t, 4, 4, 0)
+	leader := c.checkOneLeader()
+	victim := (leader + 1) % 4
+	c.remove(victim)
+	c.waitRemoved(victim)
+	time.Sleep(300 * time.Millisecond)
+	before := c.sentAppends(victim)
+	time.Sleep(time.Second)
+	if after := c.sentAppends(victim); after-before > 1 {
+		t.Fatalf("%d more messages went to a server that already knows it was removed", after-before)
+	}
+}
+
+// A removal that never commits is undone, and a server that held it must not act on it: it saw the
+// entry in its log, but the cluster never agreed to it.
+func TestUncommittedRemovalDoesNotRemove(t *testing.T) {
+	c := newMemberCluster(t, 5, 5, 0)
+	leader := c.checkOneLeader()
+	victim := (leader + 1) % 5
+	var others []int
+	for i := 0; i < 5; i++ {
+		if i != leader && i != victim {
+			others = append(others, i)
+		}
+	}
+	c.put("a", "1", 5)
+
+	c.net.Partition([]int{leader, victim}, others)
+	if _, _, err := c.nodes[leader].RemoveServer(victim); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for len(c.nodes[victim].Status().Members) != 4 { // the victim holds the entry that removes it
+		if time.Now().After(deadline) {
+			t.Fatal("the removal entry never reached the victim")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(500 * time.Millisecond)
+	c.wantNotRemoved(victim)
+
+	c.net.Heal()
+	c.checkOneLeader()
+	c.put("b", "2", 5)
+	time.Sleep(500 * time.Millisecond)
+	c.wantNotRemoved(0, 1, 2, 3, 4)
+	c.waitMembers(victim, 0, 1, 2, 3, 4)
+}
+
+// Only a committed removal counts, even while the commit index moves on past entries before it.
+func TestOnlyACommittedRemovalMarksANodeRemoved(t *testing.T) {
+	n, _ := newBare(t) // node 0 of {0, 1, 2}
+	entries := []raft.Entry{
+		{Term: 1, NoOp: true},
+		{Term: 1, Members: []raft.Member{{ID: 1}, {ID: 2}}}, // removes node 0
+	}
+	r := n.HandleAppendEntries(&raft.AppendEntriesArgs{Term: 1, LeaderID: 1, Entries: entries, LeaderCommit: 1})
+	if !r.Success {
+		t.Fatalf("append refused: %+v", r)
+	}
+	if st := n.Status(); st.Removed || st.CommitIndex != 1 || len(st.Members) != 2 {
+		t.Fatalf("the removal is in the log but not committed; got %+v", st)
+	}
+	n.HandleAppendEntries(&raft.AppendEntriesArgs{Term: 1, LeaderID: 1, PrevLogIndex: 2, PrevLogTerm: 1, LeaderCommit: 2})
+	if st := n.Status(); !st.Removed {
+		t.Fatalf("the removal committed but the node does not know: %+v", st)
 	}
 }
