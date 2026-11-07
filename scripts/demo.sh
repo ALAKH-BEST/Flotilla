@@ -50,7 +50,7 @@ run get -server "$(http 2)" city
 
 step "Find the leader and stop it"
 leader=$("$bin" status -server "$ALL" | grep -o '"leader": *[0-9]*' | grep -o '[0-9]*$')
-echo "leader is node $leader"
+echo "leader is node $leader; stopping it"
 eval "kill \$pid_$leader"
 survivors=""
 for id in 0 1 2; do [ "$id" != "$leader" ] && survivors="${survivors:+$survivors,}$(http "$id")"; done

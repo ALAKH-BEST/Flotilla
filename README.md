@@ -11,13 +11,15 @@ Raft keeps a cluster of nodes agreeing on one ordered log even when nodes crash 
 - Real processes over TCP with an HTTP API, a command-line client and on-disk state
 - Tested with injected faults and a linearizability checker over recorded histories
 
+![Flotilla demo: a write, losing the leader, restarting a node, adding and removing nodes](docs/demo.gif)
+
 ## Try it
 
 ```sh
 ./scripts/demo.sh
 ```
 
-It starts a three-node cluster on your machine and walks through a write, losing the leader, restarting a node from disk, adding a node and removing one. It needs Go and cleans up after itself.
+The recording above is this script. It starts a three-node cluster on your machine and walks through a write, losing the leader, restarting a node from disk, adding a node and removing one. It needs Go and cleans up after itself.
 
 ## Run a cluster
 
