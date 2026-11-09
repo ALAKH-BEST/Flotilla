@@ -21,6 +21,18 @@ Raft keeps a cluster of nodes agreeing on one ordered log even when nodes crash 
 
 The recording above is this script. It starts a three-node cluster on your machine and walks through a write, losing the leader, restarting a node from disk, adding a node and removing one. It needs Go and cleans up after itself.
 
+## Run with Docker
+
+```sh
+docker compose up --build -d                      # three nodes, each with its own volume
+docker compose exec node0 flotilla put -server node0:8000,node1:8000,node2:8000 city Paris
+docker compose exec node0 flotilla status -server node1:8000
+docker compose stop node1 && docker compose start node1   # restarts from its volume
+docker compose down                                # add -v to delete the data too
+```
+
+Run the client inside the containers as above: followers answer with a redirect to the leader's address, which is a container name that only resolves on the Compose network. Ports 8000-8002 are also published on your machine for `curl`, which works against the leader.
+
 ## Run a cluster
 
 ```sh
