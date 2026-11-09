@@ -691,3 +691,137 @@ func TestOnlyACommittedRemovalMarksANodeRemoved(t *testing.T) {
 		t.Fatalf("the removal committed but the node does not know: %+v", st)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Removals that were compacted into a snapshot before the leader changed
+// ---------------------------------------------------------------------------
+
+// waitCompactedPast waits until each of the given nodes has compacted its log past index.
+func (c *cluster) waitCompactedPast(index int, ids ...int) {
+	c.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for _, i := range ids {
+		for c.nodes[i].Status().SnapshotIndex <= index {
+			if time.Now().After(deadline) {
+				c.t.Fatalf("node %d has compacted only to %d, the removal is at %d", i, c.nodes[i].Status().SnapshotIndex, index)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+}
+
+// removeWhileAway removes a server that is cut off and fills the others' logs until every one of
+// them has compacted past the removal. It returns the removed server and the others.
+func (c *cluster) removeWhileAway(leader int) (victim int, others []int) {
+	c.t.Helper()
+	victim = (leader + 1) % c.n
+	c.isolate(victim)
+	removalAt := c.remove(victim)
+	for i := 0; i < 40; i++ {
+		c.put(fmt.Sprintf("k%d", i), "v", c.n-1)
+	}
+	for i := 0; i < c.n; i++ {
+		if i != victim {
+			others = append(others, i)
+		}
+	}
+	c.waitCompactedPast(removalAt, others...)
+	return victim, others
+}
+
+// The removal is only in snapshots by the time the leader changes, so the new leader cannot find
+// it in its log. It must still tell the server.
+func TestNewLeaderTellsAServerWhoseRemovalWasCompacted(t *testing.T) {
+	c := newMemberCluster(t, 5, 5, 5)
+	leader := c.checkOneLeader()
+	victim, _ := c.removeWhileAway(leader)
+
+	c.crash(leader)
+	if next := c.checkOneLeader(); next == leader {
+		t.Fatal("the crashed node cannot be the leader")
+	}
+	c.put("after", "1", 3)
+
+	c.reconnect(victim)
+	c.waitRemoved(victim)
+}
+
+// The same, when every other node restarts, so the new leader knows only what it saved to disk.
+func TestRestartedClusterTellsAServerWhoseRemovalWasCompacted(t *testing.T) {
+	c := newMemberCluster(t, 5, 5, 5)
+	leader := c.checkOneLeader()
+	victim, others := c.removeWhileAway(leader)
+
+	for _, i := range others {
+		c.crash(i)
+	}
+	for _, i := range others {
+		c.restart(i)
+	}
+	c.checkOneLeader()
+	c.put("after", "1", 4)
+
+	c.reconnect(victim)
+	c.waitRemoved(victim)
+}
+
+// A follower that was behind gets the list of removed servers along with the snapshot, so it can
+// pass it on if it becomes leader.
+func TestInstalledSnapshotCarriesTheRemovedServers(t *testing.T) {
+	c := newMemberCluster(t, 5, 5, 5)
+	leader := c.checkOneLeader()
+	victim := (leader + 1) % 5
+	lagging := (leader + 2) % 5
+	c.isolate(victim)
+	c.isolate(lagging)
+	removalAt := c.remove(victim)
+	for i := 0; i < 40; i++ {
+		c.put(fmt.Sprintf("k%d", i), "v", 3)
+	}
+	c.waitCompactedPast(removalAt, leader, (leader+3)%5, (leader+4)%5)
+
+	c.reconnect(lagging)
+	c.waitCompactedPast(removalAt, lagging)
+	c.mu.Lock()
+	installed := c.installed[lagging]
+	c.mu.Unlock()
+	if installed == 0 {
+		t.Fatal("the lagging follower caught up without a snapshot, so this test proves nothing")
+	}
+	state, _, err := c.storages[lagging].Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.SnapshotGone) != 1 || state.SnapshotGone[0].ID != victim {
+		t.Fatalf("the follower saved %v as removed servers, want just node %d", state.SnapshotGone, victim)
+	}
+}
+
+// A server removed and then added back is not one to tell.
+func TestSnapshotForgetsAServerThatWasAddedBack(t *testing.T) {
+	c := newMemberCluster(t, 4, 5, 5)
+	c.checkOneLeader()
+	c.remove(3)
+	c.waitRemoved(3)
+	c.crash(3)
+	c.restart(3) // starts again as a member of the original cluster, so it can be added back
+	c.add(3)
+	for i := 0; i < 40; i++ {
+		c.put(fmt.Sprintf("k%d", i), "v", 4)
+	}
+	for i := 0; i < 4; i++ {
+		deadline := time.Now().Add(10 * time.Second)
+		for c.nodes[i].Status().SnapshotIndex == 0 && time.Now().Before(deadline) {
+			time.Sleep(20 * time.Millisecond)
+		}
+		state, _, err := c.storages[i].Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range state.SnapshotGone {
+			if m.ID == 3 {
+				t.Fatalf("node %d still lists node 3 as removed after it was added back", i)
+			}
+		}
+	}
+}

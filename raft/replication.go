@@ -108,7 +108,7 @@ func (n *Node) sendSnapshot(peer int) {
 	n.sendingSnap[peer] = owner
 	term := n.currentTerm
 	index, lastTerm := n.snapshotIndex, n.snapshotTerm
-	data, members := n.snapshot, n.snapshotMembers // never modified once set
+	data, members, gone := n.snapshot, n.snapshotMembers, n.snapshotGone // never modified once set
 	offset := 0
 	if p := n.snapOffset[peer]; p.index == index && p.term == lastTerm {
 		offset = min(p.offset, len(data)) // resume an interrupted transfer
@@ -131,6 +131,7 @@ func (n *Node) sendSnapshot(peer int) {
 			Data:              data[offset:end],
 			Done:              end == len(data),
 			Members:           members,
+			Gone:              gone,
 		}
 		n.mu.Lock()
 		n.sendSeq++
@@ -352,6 +353,7 @@ func (n *Node) HandleInstallSnapshot(args *InstallSnapshotArgs) *InstallSnapshot
 	if len(args.Members) > 0 {
 		n.snapshotMembers = args.Members
 	}
+	n.snapshotGone = append([]Member(nil), args.Gone...)
 	n.snapshot = in.data
 	n.noteRemoval(committedBefore, n.snapshotMembers)
 	n.commitIndex = args.LastIncludedIndex

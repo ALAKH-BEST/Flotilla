@@ -34,6 +34,10 @@ type Config struct {
 	// membership change removed it from the cluster. The node then has nothing left to do: the
 	// caller should stop it.
 	OnRemoved func()
+	// OnDeparted is called, like OnMembership with the lock held, when this node becomes leader
+	// and starts telling removed servers, with those servers and their addresses. A removed
+	// server is in no membership any more, so this is how the caller learns where to reach it.
+	OnDeparted func([]Member)
 
 	Transport Transport
 	Storage   Storage
@@ -79,7 +83,9 @@ type Node struct {
 	snapshot      []byte // never modified once set, so it can be shared with RPCs
 	// snapshotMembers is the membership as of snapshotIndex; members is the one in use now.
 	snapshotMembers []Member
-	members         []Member
+	// snapshotGone are recently removed servers, as of snapshotIndex. Never modified once set.
+	snapshotGone []Member
+	members      []Member
 
 	// Volatile state.
 	commitIndex int
@@ -213,6 +219,7 @@ func New(cfg Config) (*Node, error) {
 		if len(state.SnapshotMembers) > 0 {
 			n.snapshotMembers = state.SnapshotMembers
 		}
+		n.snapshotGone = state.SnapshotGone
 		if len(n.log) == 0 {
 			n.log = []Entry{{Term: n.snapshotTerm}}
 		}
@@ -309,8 +316,10 @@ func (n *Node) Snapshot(index int, data []byte) error {
 	}
 	term := n.termAt(index)
 	members := n.membersAt(index) // before the log below index is dropped
+	gone := n.goneAfter(index)
 	n.log = append([]Entry{{Term: term}}, n.log[index-n.snapshotIndex+1:]...)
 	n.snapshotMembers = members
+	n.snapshotGone = gone
 	n.snapshotIndex = index
 	n.snapshotTerm = term
 	n.snapshot = append([]byte(nil), data...)
@@ -455,6 +464,7 @@ func (n *Node) persist() {
 		Snapshot:      n.snapshot,
 
 		SnapshotMembers: n.snapshotMembers,
+		SnapshotGone:    n.snapshotGone,
 	})
 	if err != nil {
 		panic(fmt.Sprintf("raft: node %d cannot persist state: %v", n.cfg.ID, err))
