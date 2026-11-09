@@ -1,0 +1,29 @@
+# A three-node Flotilla cluster. Each node keeps its state in its own volume, so
+# `docker compose stop node1` and `docker compose start node1` restart it from disk.
+x-node: &node
+  build: .
+  restart: unless-stopped
+
+x-cluster: &cluster "0=node0:7000/node0:8000,1=node1:7000/node1:8000,2=node2:7000/node2:8000"
+
+services:
+  node0:
+    <<: *node
+    command: ["server", "-id", "0", "-cluster", *cluster, "-data", "/data"]
+    ports: ["8000:8000"]
+    volumes: ["node0-data:/data"]
+  node1:
+    <<: *node
+    command: ["server", "-id", "1", "-cluster", *cluster, "-data", "/data"]
+    ports: ["8001:8000"]
+    volumes: ["node1-data:/data"]
+  node2:
+    <<: *node
+    command: ["server", "-id", "2", "-cluster", *cluster, "-data", "/data"]
+    ports: ["8002:8000"]
+    volumes: ["node2-data:/data"]
+
+volumes:
+  node0-data:
+  node1-data:
+  node2-data:
