@@ -102,4 +102,4 @@ How it works and what is tested in detail: [docs/design.md](docs/design.md).
 
 ## Not done
 
-A removed node that stays unreachable across a leader change, after its removal was compacted into a snapshot, is never told. Details in the design notes.
+Only the 16 most recent removals are remembered across compactions, so a removed server that stays away through more removals than that is never told. Details in the design notes.

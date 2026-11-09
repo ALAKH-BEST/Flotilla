@@ -15,12 +15,17 @@ type State struct {
 	Snapshot      []byte
 	// SnapshotMembers is the cluster membership as of SnapshotIndex.
 	SnapshotMembers []Member
+	// SnapshotGone are recently removed servers that may not know it yet, with their addresses,
+	// as of SnapshotIndex. A leader elected later keeps telling them after the removal entry itself
+	// has been compacted away.
+	SnapshotGone []Member
 }
 
 func (s State) clone() State {
 	s.Log = append([]Entry(nil), s.Log...)
 	s.Snapshot = append([]byte(nil), s.Snapshot...)
 	s.SnapshotMembers = append([]Member(nil), s.SnapshotMembers...)
+	s.SnapshotGone = append([]Member(nil), s.SnapshotGone...)
 	return s
 }
 

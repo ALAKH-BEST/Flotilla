@@ -290,11 +290,65 @@ func (n *Node) noteCommit(old int) {
 	}
 }
 
-// rebuildDeparting works out, from the log, which removed servers a new leader should still tell:
-// every server that a membership entry in the log removed and a later one did not bring back.
-// Removals compacted into a snapshot are not remembered.
+// maxGone is how many recently removed servers a snapshot remembers.
+const maxGone = 16
+
+func withoutMember(ms []Member, id int) []Member {
+	out := make([]Member, 0, len(ms))
+	for _, m := range ms {
+		if m.ID != id {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// goneAfter returns the removed servers a snapshot at index should remember: those already
+// remembered, plus every server a membership entry up to index removed, minus any added back
+// since. Only the most recent maxGone are kept, so a long-lost server is eventually given up on.
+// It must run before the log up to index is dropped (the lock must be held).
+func (n *Node) goneAfter(index int) []Member {
+	gone := append([]Member(nil), n.snapshotGone...)
+	prev := n.snapshotMembers
+	for i := n.snapshotIndex + 1; i <= index; i++ {
+		cur := n.log[i-n.snapshotIndex].Members
+		if len(cur) == 0 {
+			continue
+		}
+		for _, m := range prev {
+			if !hasMember(cur, m.ID) {
+				gone = append(withoutMember(gone, m.ID), m)
+			}
+		}
+		for _, m := range cur {
+			gone = withoutMember(gone, m.ID)
+		}
+		prev = cur
+	}
+	if len(gone) > maxGone {
+		gone = gone[len(gone)-maxGone:]
+	}
+	return gone
+}
+
+// rebuildDeparting works out which removed servers a new leader should still tell: those the
+// snapshot remembers, and every server that a membership entry in the log removed and a later
+// one did not bring back. It also hands their addresses to OnDeparted, because a removed server
+// is in no membership and the transport may never have heard of it (the lock must be held).
 func (n *Node) rebuildDeparting() {
 	n.departing = make(map[int]*departure)
+	known := make(map[int]Member)
+	track := func(m Member, index int) {
+		n.departing[m.ID] = &departure{index: index}
+		known[m.ID] = m
+		n.nextIndex[m.ID] = n.lastLogIndex() + 1
+		n.matchIndex[m.ID] = 0
+	}
+	for _, m := range n.snapshotGone {
+		if !hasMember(n.snapshotMembers, m.ID) {
+			track(m, n.snapshotIndex)
+		}
+	}
 	prev := n.snapshotMembers
 	for i := n.snapshotIndex + 1; i <= n.lastLogIndex(); i++ {
 		cur := n.log[i-n.snapshotIndex].Members
@@ -303,15 +357,20 @@ func (n *Node) rebuildDeparting() {
 		}
 		for _, m := range prev {
 			if !hasMember(cur, m.ID) {
-				n.departing[m.ID] = &departure{index: i}
-				n.nextIndex[m.ID] = n.lastLogIndex() + 1
-				n.matchIndex[m.ID] = 0
+				track(m, i)
 			}
 		}
 		for _, m := range cur {
 			delete(n.departing, m.ID)
 		}
 		prev = cur
+	}
+	if n.cfg.OnDeparted != nil && len(n.departing) > 0 {
+		list := make([]Member, 0, len(n.departing))
+		for id := range n.departing {
+			list = append(list, known[id])
+		}
+		n.cfg.OnDeparted(list)
 	}
 }
 

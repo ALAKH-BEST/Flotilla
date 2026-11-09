@@ -96,6 +96,8 @@ type InstallSnapshotArgs struct {
 	Done   bool
 	// Members is the cluster membership as of LastIncludedIndex.
 	Members []Member
+	// Gone are the recently removed servers the sender is still telling (see State.SnapshotGone).
+	Gone []Member
 }
 
 type InstallSnapshotReply struct {

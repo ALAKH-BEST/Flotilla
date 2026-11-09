@@ -147,6 +147,15 @@ func Start(cfg Config) (*Runner, error) {
 					}
 				})
 			},
+			// Removed servers are in no membership, so the leader that still tells them is given
+			// their addresses here.
+			OnDeparted: func(ms []raft.Member) {
+				for _, m := range ms {
+					if p, err := parseAddr(m.Addr); err == nil {
+						transport.SetAddr(m.ID, p.Raft)
+					}
+				}
+			},
 			OnMembership: func(ms []raft.Member) {
 				for _, m := range ms {
 					if p, err := parseAddr(m.Addr); err == nil {
