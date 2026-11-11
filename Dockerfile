@@ -13,4 +13,5 @@ USER flotilla
 VOLUME /data
 # Raft between nodes, HTTP for clients.
 EXPOSE 7000 8000
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s CMD wget -qO- http://127.0.0.1:8000/healthz || exit 1
 ENTRYPOINT ["flotilla"]
