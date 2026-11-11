@@ -62,7 +62,7 @@ To change the cluster, start the new node with `-join` (its own entry in `-clust
 ./flotilla remove -server 127.0.0.1:8000 0
 ```
 
-The HTTP API is `GET|PUT|DELETE /kv/{key}`, `GET /status`, and for membership `GET /admin/members`, `PUT /admin/members/{id}` (the body is the node's address) and `DELETE /admin/members/{id}`.
+The HTTP API is `GET|PUT|DELETE /kv/{key}`, `GET /status`, `GET /healthz` (503 once the node is removed from the cluster), `GET /metrics` (Prometheus gauges: leader, term, commit and log indexes, members), and for membership `GET /admin/members`, `PUT /admin/members/{id}` (the body is the node's address) and `DELETE /admin/members/{id}`.
 
 ## Use as a library
 

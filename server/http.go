@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -27,6 +28,8 @@ type HTTPOptions struct {
 //	PUT    /kv/{key}   set the key to the request body
 //	DELETE /kv/{key}   remove the key
 //	GET    /status     this node's view of the cluster, as JSON
+//	GET    /healthz    200 while this node is running, 503 once the cluster has removed it
+//	GET    /metrics    this node's state as Prometheus gauges (plain text)
 //
 // Membership (changes are followed by a redirect to the leader, like writes):
 //
@@ -120,6 +123,40 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 			"members":       st.Members,
 			"learners":      st.Learners,
 		})
+	})
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		if s.node.Status().Removed {
+			http.Error(w, "removed from the cluster", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, "ok\n")
+	})
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		st := s.node.Status()
+		b2i := func(b bool) int {
+			if b {
+				return 1
+			}
+			return 0
+		}
+		gauges := []struct {
+			name, help string
+			value      int
+		}{
+			{"flotilla_is_leader", "1 if this node is the leader.", b2i(st.Role == raft.Leader)},
+			{"flotilla_term", "Current term.", st.Term},
+			{"flotilla_commit_index", "Highest log index known to be committed.", st.CommitIndex},
+			{"flotilla_last_log_index", "Highest log index in this node's log.", st.LastLogIndex},
+			{"flotilla_snapshot_index", "Last log index covered by the snapshot (0 if none).", st.SnapshotIndex},
+			{"flotilla_log_entries", "Log entries held in memory after the snapshot.", st.LogEntries},
+			{"flotilla_voters", "Voting members this node uses.", len(st.Members)},
+			{"flotilla_learners", "Non-voting members this node replicates to.", len(st.Learners)},
+			{"flotilla_removed", "1 once a committed change has removed this node.", b2i(st.Removed)},
+		}
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		for _, g := range gauges {
+			fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s{node=\"%d\"} %d\n", g.name, g.help, g.name, g.name, st.ID, g.value)
+		}
 	})
 	return mux
 }
