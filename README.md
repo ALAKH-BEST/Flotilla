@@ -110,6 +110,12 @@ go test -race ./...
 
 Real nodes run over `simnet` while a nemesis isolates, partitions, crashes and restarts them, with concurrent clients. Every operation is recorded and the checker in `linearize/` verifies the history is linearizable, including while servers are added and removed. Targeted tests cover each safety rule, and I checked they fail when the rule is deliberately broken.
 
+A second test runs five real processes and breaks them with SIGKILL, SIGSTOP and cut network links, then checks the same way:
+
+```sh
+FLOTILLA_CHAOS=1 go test ./chaos -run TestChaos -v
+```
+
 How it works and what is tested in detail: [docs/design.md](docs/design.md).
 
 ## Not done

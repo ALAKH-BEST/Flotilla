@@ -63,7 +63,15 @@ Every applied entry is also compared across replicas, and the test fails if two 
 
 **Linearizability.** The server tests run clients against five servers while a nemesis isolates nodes, splits the cluster and crashes and restarts nodes. Every operation is recorded with its start and end times, and the checker in `linearize/` (a search in the style of Wing and Gong, with memoization) verifies that the whole history is linearizable. A second run adds and removes servers at random, the leader included, among the same faults.
 
-**Do the tests bite?** For each guarantee above I broke the code on purpose (skipping a check, counting the wrong set of nodes, dropping a step) and confirmed a test fails. Several tests were added or tightened because a mutation survived the first time. The random runs are not what catches most of these: they inject one fault at a time and rarely build the situations that unsafe rules need, so the targeted tests carry that load.
+**Real processes.** The `chaos/` test starts five `flotilla` processes with real TCP and disk. Each node reaches its peers through a small TCP proxy, so the test can cut any link between two live processes. A nemesis then kills nodes with SIGKILL and restarts them from disk, freezes and unfreezes them with SIGSTOP and SIGCONT, splits the network, and cuts off whoever leads at that moment. Five clients send writes and reads over HTTP, retrying with the same `X-Seq` so each runs once. One more reader per node asks that node alone and never follows a redirect, so a node that wrongly thinks it still leads has nothing to hide behind. After everything is restored the test reads every key once more, waits for every node to report the same commit index, and checks the whole history with `linearize/`.
+
+```sh
+FLOTILLA_CHAOS=1 go test ./chaos -run TestChaos -v
+```
+
+It is skipped without `FLOTILLA_CHAOS`, since it takes about 30 seconds. `FLOTILLA_CHAOS_SECONDS` sets the length and `FLOTILLA_CHAOS_SEED` repeats a fault schedule (the schedule repeats; the timing of the real processes does not). On a failure the node logs are copied to a temporary directory whose path is printed.
+
+**Do the tests bite?** For each guarantee above I broke the code on purpose (skipping a check, counting the wrong set of nodes, dropping a step) and confirmed a test fails. Several tests were added or tightened because a mutation survived the first time. The random runs are not what catches most of these: they inject one fault at a time and rarely build the situations that unsafe rules need, so the targeted tests carry that load. The real-process test is the same: with reads made to skip the check that a majority still follows the leader, it fails on some seeds and not others (3 of 5 in my runs), and only after it was changed to isolate the current leader and to read from each node directly. Run several seeds before trusting a pass.
 
 ## Not done
 
