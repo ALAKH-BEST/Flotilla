@@ -77,3 +77,46 @@ func TestHealthzFailsAfterRemoval(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+func put(t *testing.T, h http.Handler, path string) int {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("PUT", path, nil))
+	return rec.Code
+}
+
+// PUT /admin/leader/{id} moves leadership, and the cluster keeps serving writes afterwards. A
+// follower does not do it (it has no leader address to redirect to here, so it says 503), a node
+// that cannot lead is refused with 409, and a bad ID with 400.
+func TestAdminLeaderHandsOverLeadership(t *testing.T) {
+	c := newKVCluster(t, 3, 0)
+	dl := ctx(t, 30*time.Second)
+	if err := c.clerk(1).Put(dl, "k", "v"); err != nil {
+		t.Fatal(err)
+	}
+	leader := c.leader(t)
+	target := (leader + 1) % 3
+	lh := c.servers[leader].HTTPHandler(server.HTTPOptions{})
+
+	if code := put(t, c.servers[target].HTTPHandler(server.HTTPOptions{}), "/admin/leader/"+string(rune('0'+leader))); code != http.StatusServiceUnavailable {
+		t.Errorf("from a follower: %d, want 503", code)
+	}
+	if code := put(t, lh, "/admin/leader/9"); code != http.StatusConflict {
+		t.Errorf("to a stranger: %d, want 409", code)
+	}
+	if code := put(t, lh, "/admin/leader/x"); code != http.StatusBadRequest {
+		t.Errorf("to a bad ID: %d, want 400", code)
+	}
+	if code := put(t, lh, "/admin/leader/"+string(rune('0'+target))); code != http.StatusNoContent {
+		t.Fatalf("hand-over: %d, want 204", code)
+	}
+	if got := c.leader(t); got != target {
+		t.Fatalf("node %d leads, want %d", got, target)
+	}
+	if err := c.clerk(2).Put(dl, "k2", "v2"); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok, err := c.clerk(3).Get(dl, "k"); err != nil || !ok || v != "v" {
+		t.Fatalf("read after hand-over: %q %v %v", v, ok, err)
+	}
+}

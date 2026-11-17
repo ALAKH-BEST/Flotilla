@@ -193,7 +193,7 @@ func (h *harness) nemesis(rng *rand.Rand, stop <-chan struct{}, log func(string,
 			return
 		case <-time.After(time.Duration(500+rng.Intn(1500)) * time.Millisecond):
 		}
-		switch rng.Intn(9) {
+		switch rng.Intn(11) {
 		case 0, 1:
 			if n := pick(func(n *node) bool { return n.cmd != nil && !n.paused }); n != nil && h.down() < maxDown {
 				log("kill -9 node %d", n.id)
@@ -225,6 +225,18 @@ func (h *harness) nemesis(rng *rand.Rand, stop <-chan struct{}, log func(string,
 		case 6:
 			log("heal network")
 			h.heal()
+		case 9, 10:
+			// Hand leadership to another node while clients are writing. It may fail (the target
+			// might be frozen or cut off), which is fine; what matters is that nothing breaks.
+			if id, ok := h.leader(); ok {
+				if n := pick(func(n *node) bool { return n.id != id && n.cmd != nil && !n.paused }); n != nil {
+					log("transfer leadership %d -> %d", id, n.id)
+					req, _ := http.NewRequest(http.MethodPut, "http://"+h.nodes[id].httpAddr+"/admin/leader/"+strconv.Itoa(n.id), nil)
+					if resp, err := (&http.Client{Timeout: 4 * time.Second}).Do(req); err == nil {
+						resp.Body.Close()
+					}
+				}
+			}
 		case 7, 8:
 			// Cut off whoever leads right now. The rest elect a new leader while the old one may
 			// still think it is in charge, which is when a stale answer could slip out.

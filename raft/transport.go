@@ -7,6 +7,7 @@ type Transport interface {
 	RequestVote(to int, args *RequestVoteArgs) (*RequestVoteReply, error)
 	PreVote(to int, args *PreVoteArgs) (*PreVoteReply, error)
 	AppendEntries(to int, args *AppendEntriesArgs) (*AppendEntriesReply, error)
+	TimeoutNow(to int, args *TimeoutNowArgs) (*TimeoutNowReply, error)
 	InstallSnapshot(to int, args *InstallSnapshotArgs) (*InstallSnapshotReply, error)
 }
 
@@ -15,5 +16,6 @@ type Handler interface {
 	HandleRequestVote(args *RequestVoteArgs) *RequestVoteReply
 	HandlePreVote(args *PreVoteArgs) *PreVoteReply
 	HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply
+	HandleTimeoutNow(args *TimeoutNowArgs) *TimeoutNowReply
 	HandleInstallSnapshot(args *InstallSnapshotArgs) *InstallSnapshotReply
 }

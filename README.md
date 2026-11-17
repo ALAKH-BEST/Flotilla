@@ -8,6 +8,7 @@ Raft keeps a cluster of nodes agreeing on one ordered log even when nodes crash 
 - Snapshots and log compaction, with snapshot transfer to followers that fell behind
 - A key-value state machine with exactly-once writes and linearizable reads that cost no log entry
 - Cluster membership changes while running: add (through a non-voting learner) and remove, the leader included
+- Leadership transfer: hand leadership to a chosen node before maintenance, with no election timeout to wait out
 - Real processes over TCP with an HTTP API, a command-line client and on-disk state
 - Tested with injected faults and a linearizability checker over recorded histories
 
@@ -62,7 +63,14 @@ To change the cluster, start the new node with `-join` (its own entry in `-clust
 ./flotilla remove -server 127.0.0.1:8000 0
 ```
 
-The HTTP API is `GET|PUT|DELETE /kv/{key}`, `GET /status`, `GET /healthz` (503 once the node is removed from the cluster), `GET /metrics` (Prometheus gauges: leader, term, commit and log indexes, members), and for membership `GET /admin/members`, `PUT /admin/members/{id}` (the body is the node's address) and `DELETE /admin/members/{id}`.
+To take the leader down without clients waiting for an election, hand leadership to another voter first:
+
+```sh
+./flotilla transfer -server 127.0.0.1:8000 2     # node 2 becomes leader
+```
+
+
+The HTTP API is `GET|PUT|DELETE /kv/{key}`, `GET /status`, `GET /healthz` (503 once the node is removed from the cluster), `GET /metrics` (Prometheus gauges: leader, term, commit and log indexes, members), and for membership `GET /admin/members`, `PUT /admin/members/{id}` (the body is the node's address) and `DELETE /admin/members/{id}`, and `PUT /admin/leader/{id}` to hand leadership to voter `{id}` (204 once the leader has stepped down, 409 if `{id}` cannot lead, 504 if it did not take over in time and the leader carries on).
 
 ## Use as a library
 

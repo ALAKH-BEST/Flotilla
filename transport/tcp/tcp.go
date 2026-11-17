@@ -162,6 +162,14 @@ func (t *Transport) AppendEntries(to int, args *raft.AppendEntriesArgs) (*raft.A
 	return reply, nil
 }
 
+func (t *Transport) TimeoutNow(to int, args *raft.TimeoutNowArgs) (*raft.TimeoutNowReply, error) {
+	reply := new(raft.TimeoutNowReply)
+	if err := t.call(to, "Raft.TimeoutNow", args, reply, t.CallTimeout); err != nil {
+		return nil, err
+	}
+	return reply, nil
+}
+
 func (t *Transport) InstallSnapshot(to int, args *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
 	reply := new(raft.InstallSnapshotReply)
 	if err := t.call(to, "Raft.InstallSnapshot", args, reply, t.SnapshotTimeout); err != nil {
@@ -185,6 +193,11 @@ func (s *service) PreVote(args *raft.PreVoteArgs, reply *raft.PreVoteReply) erro
 
 func (s *service) AppendEntries(args *raft.AppendEntriesArgs, reply *raft.AppendEntriesReply) error {
 	*reply = *s.h.HandleAppendEntries(args)
+	return nil
+}
+
+func (s *service) TimeoutNow(args *raft.TimeoutNowArgs, reply *raft.TimeoutNowReply) error {
+	*reply = *s.h.HandleTimeoutNow(args)
 	return nil
 }
 

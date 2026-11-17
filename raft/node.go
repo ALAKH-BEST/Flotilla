@@ -49,6 +49,9 @@ type Config struct {
 	ElectionTimeoutMax time.Duration
 	HeartbeatInterval  time.Duration
 	TickInterval       time.Duration
+	// TransferTimeout is how long a leadership transfer may take before the leader gives up and
+	// carries on (default 2 seconds).
+	TransferTimeout time.Duration
 	// SnapshotChunkSize is the most snapshot bytes sent in one message (default 64 KiB).
 	SnapshotChunkSize int
 
@@ -62,6 +65,7 @@ const (
 	defaultHeartbeatInterval  = 40 * time.Millisecond
 	defaultTickInterval       = 10 * time.Millisecond
 	defaultSnapshotChunkSize  = 64 << 10
+	defaultTransferTimeout    = 2 * time.Second
 )
 
 // Node is one member of a Raft cluster.
@@ -123,6 +127,12 @@ type Node struct {
 	departing map[int]*departure
 	// removed is set once a committed change has removed this node.
 	removed bool
+	// A leadership transfer in progress: while transferring, the leader takes no new commands.
+	transferring     bool
+	transferTarget   int
+	transferDeadline time.Time
+	transferSentAt   time.Time
+	transferDone     chan error
 	// lastLeaderContact is when this node last heard from a leader that was valid for its term.
 	// epoch counts resets of the election timer, so a pre-vote round can tell it went stale.
 	lastLeaderContact time.Time
@@ -176,6 +186,9 @@ func New(cfg Config) (*Node, error) {
 	}
 	if cfg.TickInterval == 0 {
 		cfg.TickInterval = defaultTickInterval
+	}
+	if cfg.TransferTimeout == 0 {
+		cfg.TransferTimeout = defaultTransferTimeout
 	}
 	if cfg.SnapshotChunkSize <= 0 {
 		cfg.SnapshotChunkSize = defaultSnapshotChunkSize
@@ -269,7 +282,7 @@ func (n *Node) Stop() {
 func (n *Node) Propose(command []byte) (index, term int, isLeader bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.stopped || n.role != Leader {
+	if n.stopped || n.role != Leader || n.transferring {
 		return 0, n.currentTerm, false
 	}
 	n.log = append(n.log, Entry{Term: n.currentTerm, Command: command})
@@ -358,6 +371,7 @@ func (n *Node) tick(now time.Time) {
 			n.resetElectionDeadline()
 			return
 		}
+		n.checkTransfer(now)
 		if !now.Before(n.nextHeartbeat) {
 			n.nextHeartbeat = now.Add(n.cfg.HeartbeatInterval)
 			n.broadcastAppendEntries()
@@ -473,6 +487,13 @@ func (n *Node) persist() {
 
 // becomeFollower moves to a follower of the given term. A newer term clears the vote.
 func (n *Node) becomeFollower(term int) {
+	if n.transferring {
+		if term > n.currentTerm {
+			n.endTransfer(nil) // a newer term has begun: someone else leads now
+		} else {
+			n.endTransfer(ErrNotLeader)
+		}
+	}
 	if term > n.currentTerm {
 		n.currentTerm = term
 		n.votedFor = -1

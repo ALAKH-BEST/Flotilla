@@ -23,6 +23,10 @@ func (noTransport) AppendEntries(int, *raft.AppendEntriesArgs) (*raft.AppendEntr
 	return nil, errors.New("no peers")
 }
 
+func (noTransport) TimeoutNow(int, *raft.TimeoutNowArgs) (*raft.TimeoutNowReply, error) {
+	return nil, errors.New("no peers")
+}
+
 func (noTransport) InstallSnapshot(int, *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
 	return nil, errors.New("no peers")
 }

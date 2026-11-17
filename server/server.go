@@ -135,6 +135,16 @@ func (s *Server) HandleAppendEntries(args *raft.AppendEntriesArgs) *raft.AppendE
 	return s.node.HandleAppendEntries(args)
 }
 
+func (s *Server) HandleTimeoutNow(args *raft.TimeoutNowArgs) *raft.TimeoutNowReply {
+	return s.node.HandleTimeoutNow(args)
+}
+
+// TransferLeadership hands leadership to the voting member id (see raft.Node.TransferLeadership).
+// It must be called on the leader and returns once this server has stepped down.
+func (s *Server) TransferLeadership(ctx context.Context, id int) error {
+	return mapRaftErr(s.node.TransferLeadership(ctx, id))
+}
+
 func (s *Server) HandleInstallSnapshot(args *raft.InstallSnapshotArgs) *raft.InstallSnapshotReply {
 	return s.node.HandleInstallSnapshot(args)
 }
