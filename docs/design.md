@@ -17,7 +17,8 @@ How Flotilla works, and how it is tested. Section numbers refer to the [Raft pap
 - A follower reports where its log diverges, so the leader backs up a term at a time instead of one entry.
 - Followers truncate only at a real conflict, so delayed or duplicated messages cannot remove correct entries.
 - If storage fails, the node panics instead of risking a forgotten vote or entry.
-- `FileStorage` writes the whole state to a temporary file, syncs it, renames it over the old one and syncs the directory, so a crash leaves either the old state or the new one. Every save rewrites the whole state, which is acceptable because snapshots keep the log short.
+- `FileStorage` keeps the state in one append-only file of checksummed records. The first record is a checkpoint, the whole state. Each later record is a delta: the new term and vote, how many log entries to keep, and the entries to add after them. A save that only appends writes just the new entries and syncs once, however long the log is; a save that changes nothing writes nothing. A snapshot, or anything that cannot be written as a delta, replaces the file with a fresh checkpoint (written to a temporary file, synced, renamed over the old one, directory synced), which is also what keeps the file from growing without bound.
+- A crash while a delta is being appended leaves a torn record at the end of the file. Loading ignores it and removes it, so later appends follow valid data. A bad record with more data after it is damage, not a torn write, and loading fails rather than silently forgetting acknowledged writes. A directory in the earlier single-file format is read as the starting checkpoint and replaced on the first save.
 
 ## Snapshots
 
@@ -68,6 +69,7 @@ How Flotilla works, and how it is tested. Section numbers refer to the [Raft pap
 - a learner does not count towards a majority and never campaigns; adding a server waits for it to catch up
 - a cut-off follower does not raise its term and a returning node does not force an election; a leader cut off from a majority steps down and a healthy one does not
 - a leadership transfer makes exactly the chosen node leader without waiting out a timeout, catches a lagging target up first, is cancelled when the target never takes over (the leader refuses commands meanwhile and then resumes), refuses a follower, a stranger and a learner, and a timeout-now from anyone but the current leader is ignored
+- the file storage appends instead of rewriting, round-trips a random history of appends, tail rewrites, term changes and snapshots, recovers the right state when the file is cut at every possible byte, reports damage in the middle of the file, and reads the old single-file format
 - reads add nothing to the log, a follower refuses them, a new leader refuses a read index until it has committed in its term, and a read waits for the state machine to catch up
 
 Every applied entry is also compared across replicas, and the test fails if two nodes ever disagree at the same index.
