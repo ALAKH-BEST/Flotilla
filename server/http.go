@@ -37,6 +37,8 @@ type HTTPOptions struct {
 //	PUT    /admin/members/{id}  add node id as a learner, then promote it to a voter once it has
 //	                            caught up; the body is its address, passed on to every node
 //	DELETE /admin/members/{id}  remove node id
+//	PUT    /admin/leader/{id}   hand leadership to voting member id (204 once this node has stepped
+//	                            down; 504 if id did not take over in time and this node stays leader)
 //
 // A node that is not the leader answers with a 307 redirect to the leader when it knows
 // one, and 503 otherwise. A client that wants a retried write to run exactly once sends
@@ -103,6 +105,18 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 			return
 		}
 		if err := s.RemoveServer(r.Context(), id); err != nil {
+			s.fail(w, r, opts, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("PUT /admin/leader/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.Atoi(r.PathValue("id"))
+		if err != nil || id < 0 {
+			http.Error(w, "want PUT /admin/leader/{id}", http.StatusBadRequest)
+			return
+		}
+		if err := s.TransferLeadership(r.Context(), id); err != nil {
 			s.fail(w, r, opts, err)
 			return
 		}
@@ -205,8 +219,11 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, opts HTTPOptions, 
 		// the client went away; nothing to write
 	case errors.Is(err, raft.ErrAlreadyMember), errors.Is(err, raft.ErrNotMember),
 		errors.Is(err, raft.ErrLastMember), errors.Is(err, raft.ErrChangeInProgress),
-		errors.Is(err, raft.ErrNotLearner):
+		errors.Is(err, raft.ErrNotLearner), errors.Is(err, raft.ErrBadTransferTarget),
+		errors.Is(err, raft.ErrTransferInProgress):
 		http.Error(w, err.Error(), http.StatusConflict)
+	case errors.Is(err, raft.ErrTransferTimeout):
+		http.Error(w, err.Error(), http.StatusGatewayTimeout)
 	default: // including raft.ErrNotReady: a new leader that cannot yet accept this, so try again
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 	}

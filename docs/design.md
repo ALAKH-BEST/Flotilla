@@ -42,6 +42,16 @@ How Flotilla works, and how it is tested. Section numbers refer to the [Raft pap
 - A new node is added as a **learner**: it receives the log and snapshots but does not vote, campaign, or count towards commits or read confirmation. Only promoting it changes the voters, one server at a time. `Server.AddServer` waits until the learner trails the commit index by a few entries before promoting it; this protects availability, not safety. If it fails part way the node stays a learner and `flotilla add` can be run again.
 - Every node learns a new node's address from the log, so a node restarted from its data directory needs no address list.
 
+## Leadership transfer
+
+`Node.TransferLeadership` (section 3.10 of Ongaro's thesis) moves leadership to a chosen voter without waiting for an election timeout, so a leader can be drained before it is stopped.
+
+- The leader stops accepting new commands (`Propose` reports not leader, so clients move on), keeps replicating, and waits until the target's log matches its own. A target that is behind therefore never loses the election for that reason.
+- It then sends `TimeoutNow`. The target starts a real election at once, skipping pre-vote, since the leader has chosen the moment and pre-vote would refuse a node that still hears a leader. It acts only on a `TimeoutNow` from the leader of its current term, so a stale or forged message cannot start an election. The message is resent every minimum election timeout in case it was lost.
+- When the target wins, its higher term makes the old leader step down, which ends the transfer. If nothing happens within `Config.TransferTimeout` (default 2 seconds), or the caller's context ends, the transfer is cancelled and the node carries on as leader.
+- Reads are still served during a transfer: the leader is still the leader until a newer term appears.
+- Only another voting member can be a target (not a learner, not the leader itself), and one transfer runs at a time.
+
 ## Testing
 
 `go test -race ./...` runs everything. The tests run real nodes over `simnet`, which can drop, delay, isolate and partition, and check:
@@ -57,13 +67,14 @@ How Flotilla works, and how it is tested. Section numbers refer to the [Raft pap
 - the membership survives compaction and restarts, including a node that joins after the log was compacted past its entry
 - a learner does not count towards a majority and never campaigns; adding a server waits for it to catch up
 - a cut-off follower does not raise its term and a returning node does not force an election; a leader cut off from a majority steps down and a healthy one does not
+- a leadership transfer makes exactly the chosen node leader without waiting out a timeout, catches a lagging target up first, is cancelled when the target never takes over (the leader refuses commands meanwhile and then resumes), refuses a follower, a stranger and a learner, and a timeout-now from anyone but the current leader is ignored
 - reads add nothing to the log, a follower refuses them, a new leader refuses a read index until it has committed in its term, and a read waits for the state machine to catch up
 
 Every applied entry is also compared across replicas, and the test fails if two nodes ever disagree at the same index.
 
 **Linearizability.** The server tests run clients against five servers while a nemesis isolates nodes, splits the cluster and crashes and restarts nodes. Every operation is recorded with its start and end times, and the checker in `linearize/` (a search in the style of Wing and Gong, with memoization) verifies that the whole history is linearizable. A second run adds and removes servers at random, the leader included, among the same faults.
 
-**Real processes.** The `chaos/` test starts five `flotilla` processes with real TCP and disk. Each node reaches its peers through a small TCP proxy, so the test can cut any link between two live processes. A nemesis then kills nodes with SIGKILL and restarts them from disk, freezes and unfreezes them with SIGSTOP and SIGCONT, splits the network, and cuts off whoever leads at that moment. Five clients send writes and reads over HTTP, retrying with the same `X-Seq` so each runs once. One more reader per node asks that node alone and never follows a redirect, so a node that wrongly thinks it still leads has nothing to hide behind. After everything is restored the test reads every key once more, waits for every node to report the same commit index, and checks the whole history with `linearize/`.
+**Real processes.** The `chaos/` test starts five `flotilla` processes with real TCP and disk. Each node reaches its peers through a small TCP proxy, so the test can cut any link between two live processes. A nemesis then kills nodes with SIGKILL and restarts them from disk, hands leadership to another node while clients write, freezes and unfreezes them with SIGSTOP and SIGCONT, splits the network, and cuts off whoever leads at that moment. Five clients send writes and reads over HTTP, retrying with the same `X-Seq` so each runs once. One more reader per node asks that node alone and never follows a redirect, so a node that wrongly thinks it still leads has nothing to hide behind. After everything is restored the test reads every key once more, waits for every node to report the same commit index, and checks the whole history with `linearize/`.
 
 ```sh
 FLOTILLA_CHAOS=1 go test ./chaos -run TestChaos -v

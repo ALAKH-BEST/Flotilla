@@ -25,6 +25,7 @@ const usage = `usage:
   flotilla members [-server ADDRS]
   flotilla add    [-server ADDRS] ID RAFT_ADDR/HTTP_ADDR
   flotilla remove [-server ADDRS] ID
+  flotilla transfer [-server ADDRS] ID
 
 SPEC is a comma-separated list of id=raftHost:port/httpHost:port, for example
   0=127.0.0.1:7000/127.0.0.1:8000,1=127.0.0.1:7001/127.0.0.1:8001,2=127.0.0.1:7002/127.0.0.1:8002
@@ -32,6 +33,7 @@ ADDRS is a comma-separated list of HTTP addresses (default 127.0.0.1:8000).
 
 To grow a cluster, start the new node with -join (its own entry in -cluster gives its
 addresses), then run "flotilla add" with those addresses. "flotilla remove" takes a node out.
+"flotilla transfer" hands leadership to a voting node, for example before stopping the leader.
 `
 
 func main() {
@@ -44,7 +46,7 @@ func main() {
 	switch cmd {
 	case "server":
 		err = runServer(args)
-	case "get", "put", "delete", "status", "members", "add", "remove":
+	case "get", "put", "delete", "status", "members", "add", "remove", "transfer":
 		err = runClient(cmd, args)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
@@ -108,6 +110,8 @@ func runClient(cmd string, args []string) error {
 		method, want = http.MethodPut, 2
 	case "remove":
 		method = http.MethodDelete
+	case "transfer":
+		method = http.MethodPut
 	}
 	if len(rest) != want {
 		return fmt.Errorf("%s takes %d argument(s)\n\n%s", cmd, want, usage)
@@ -115,11 +119,14 @@ func runClient(cmd string, args []string) error {
 	switch cmd {
 	case "get", "put", "delete":
 		path = "/kv/" + rest[0]
-	case "add", "remove":
+	case "add", "remove", "transfer":
 		if _, err := strconv.Atoi(rest[0]); err != nil {
 			return fmt.Errorf("the node ID must be a number, got %q", rest[0])
 		}
 		path = "/admin/members/" + rest[0]
+		if cmd == "transfer" {
+			path = "/admin/leader/" + rest[0]
+		}
 	}
 	if cmd == "put" || cmd == "add" {
 		body = rest[len(rest)-1]

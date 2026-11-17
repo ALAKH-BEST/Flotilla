@@ -126,6 +126,12 @@ func (e *endpoint) AppendEntries(to int, args *raft.AppendEntriesArgs) (*raft.Ap
 	return reply, err
 }
 
+func (e *endpoint) TimeoutNow(to int, args *raft.TimeoutNowArgs) (*raft.TimeoutNowReply, error) {
+	var reply *raft.TimeoutNowReply
+	err := e.net.deliver(e.from, to, func(h raft.Handler) { reply = h.HandleTimeoutNow(args) })
+	return reply, err
+}
+
 func (e *endpoint) InstallSnapshot(to int, args *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
 	var reply *raft.InstallSnapshotReply
 	err := e.net.deliver(e.from, to, func(h raft.Handler) { reply = h.HandleInstallSnapshot(args) })

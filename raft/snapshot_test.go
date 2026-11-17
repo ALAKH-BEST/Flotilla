@@ -246,6 +246,9 @@ func (nil2) PreVote(int, *raft.PreVoteArgs) (*raft.PreVoteReply, error) {
 func (nil2) AppendEntries(int, *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
 	return nil, fmt.Errorf("down")
 }
+func (nil2) TimeoutNow(int, *raft.TimeoutNowArgs) (*raft.TimeoutNowReply, error) {
+	return nil, fmt.Errorf("down")
+}
 func (nil2) InstallSnapshot(int, *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
 	return nil, fmt.Errorf("down")
 }
