@@ -126,6 +126,20 @@ FLOTILLA_CHAOS=1 go test ./chaos -run TestChaos -v
 
 How it works and what is tested in detail: [docs/design.md](docs/design.md).
 
+## Performance
+
+`FLOTILLA_BENCH=1 go test ./bench -run TestBench -v -timeout 10m` starts three real processes with real TCP and disk and measures them. Results from a 2-CPU virtual machine, 100-byte values, 5 seconds per row:
+
+| | 1 client | 8 clients | 32 clients | 128 clients |
+|---|---|---|---|---|
+| writes, ops/s (p50 latency) | 307 (3.0 ms) | 352 (21 ms) | 317 (94 ms) | 264 (461 ms) |
+| linearizable reads, ops/s (p50) | 4,655 (0.2 ms) | 10,230 (0.6 ms) | 12,608 (2.1 ms) | 12,272 (9.6 ms) |
+
+- Killing the leader with SIGKILL: a write succeeds again through the survivors after about 240 ms (201 to 282 ms over 8 runs).
+- `flotilla transfer`: the call returns in about 7 ms and the new leader accepts a write after about 30 ms (8 runs), against the roughly 240 ms of a failover.
+- **Writes are limited by the disk.** They do not speed up with more clients, and with state kept in memory (`FLOTILLA_BENCH_MEMORY=1`) the same cluster does 1,300 to 1,900 writes per second. Every save rewrites the node's whole state and syncs the file, the rename and the directory, with no batching of writes that arrive together. Replacing that with an append-only log that syncs once per batch is the obvious next step.
+- These numbers are one machine's. The disk dominates the write rows, so expect them to differ elsewhere.
+
 ## Not done
 
 Only the 16 most recent removals are remembered across compactions, so a removed server that stays away through more removals than that is never told. Details in the design notes.
