@@ -825,3 +825,79 @@ func TestSnapshotForgetsAServerThatWasAddedBack(t *testing.T) {
 		}
 	}
 }
+
+// A snapshot remembers every removed server, by default, not just the most recent few: a server
+// that stays away through any number of removals is still told when it comes back.
+func TestSnapshotRemembersManyRemovedServers(t *testing.T) {
+	c := newMemberCluster(t, 8, 8, 5)
+	c.checkOneLeader()
+	// Nodes 0-2 stay; 3-7 are removed one after another, and one of them is cut off throughout.
+	c.isolate(7)
+	for _, id := range []int{7, 6, 5, 4, 3} {
+		c.remove(id)
+	}
+	for i := 0; i < 40; i++ {
+		c.put(fmt.Sprintf("k%d", i), "v", 3)
+	}
+	var gone int
+	for i := 0; i < 3; i++ {
+		deadline := time.Now().Add(10 * time.Second)
+		for c.nodes[i].Status().SnapshotIndex == 0 && time.Now().Before(deadline) {
+			time.Sleep(20 * time.Millisecond)
+		}
+		state, _, err := c.storages[i].Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 || len(state.SnapshotGone) < gone {
+			gone = len(state.SnapshotGone)
+		}
+	}
+	if gone != 5 {
+		t.Fatalf("a node's snapshot lists %d removed servers, want all 5", gone)
+	}
+	c.reconnect(7)
+	c.waitRemoved(7)
+}
+
+// Config.MaxGone bounds what a snapshot remembers, keeping the most recent removals.
+func TestMaxGoneBoundsWhatASnapshotRemembers(t *testing.T) {
+	c := newMemberClusterWith(t, 8, 8, 5, 2)
+	c.checkOneLeader()
+	for _, id := range []int{7, 6, 5, 4, 3} {
+		c.remove(id)
+	}
+	for i := 0; i < 40; i++ {
+		c.put(fmt.Sprintf("k%d", i), "v", 3)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for c.nodes[0].Status().SnapshotIndex == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	state, _, err := c.storages[0].Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.SnapshotGone) > 2 {
+		t.Fatalf("the snapshot lists %d removed servers with MaxGone 2: %v", len(state.SnapshotGone), state.SnapshotGone)
+	}
+}
+
+// A server that is gone for good is tried less and less often, so remembering it costs almost nothing.
+func TestRemovedServerIsRetriedWithBackoff(t *testing.T) {
+	c := newMemberCluster(t, 4, 4, 0)
+	leader := c.checkOneLeader()
+	victim := (leader + 1) % 4
+	c.isolate(victim)
+	c.remove(victim)
+	c.put("a", "1", 3)
+	before := c.sentAppends(victim)
+	time.Sleep(4 * time.Second)
+	// Every ten heartbeats (400 ms) would be about ten attempts; with backoff it is five or six
+	// (at 0.4, 0.8, 1.6, 3.2 s after the first, which comes at once).
+	if tries := c.sentAppends(victim) - before; tries > 7 {
+		t.Fatalf("%d attempts to reach a removed server in 4 seconds, want the retries to space out (at most 7)", tries)
+	}
+	c.reconnect(victim)
+	c.waitRemoved(victim) // it is still told once reachable
+}

@@ -255,11 +255,25 @@ func (n *Node) proposeMembers(members []Member) (index, term int, err error) {
 type departure struct {
 	index    int       // the log index of the entry that removed it
 	nextTry  time.Time // departing servers are tried far less often than members
+	tries    int       // attempts so far, which sets how long to wait for the next
 	inflight bool
 }
 
-// departRetry is how many heartbeat intervals pass between attempts to reach a removed server.
-const departRetry = 10
+// A removed server is tried every departRetry heartbeat intervals at first, and the wait doubles
+// after each attempt up to departRetryMax, so a server that is gone for good costs almost nothing
+// while one that comes back is still told within a few seconds.
+const (
+	departRetry    = 10
+	departRetryMax = 100
+)
+
+// departWait is how many heartbeat intervals to leave before the next attempt, after tries attempts.
+func departWait(tries int) int {
+	if tries >= 4 { // 10 << 4 is already past the maximum
+		return departRetryMax
+	}
+	return min(departRetry<<tries, departRetryMax)
+}
 
 func hasMember(ms []Member, id int) bool {
 	for _, m := range ms {
@@ -290,8 +304,8 @@ func (n *Node) noteCommit(old int) {
 	}
 }
 
-// maxGone is how many recently removed servers a snapshot remembers.
-const maxGone = 16
+// defaultMaxGone is how many removed servers a snapshot remembers unless Config.MaxGone says otherwise.
+const defaultMaxGone = 1024
 
 func withoutMember(ms []Member, id int) []Member {
 	out := make([]Member, 0, len(ms))
@@ -305,7 +319,7 @@ func withoutMember(ms []Member, id int) []Member {
 
 // goneAfter returns the removed servers a snapshot at index should remember: those already
 // remembered, plus every server a membership entry up to index removed, minus any added back
-// since. Only the most recent maxGone are kept, so a long-lost server is eventually given up on.
+// since. Only the most recent Config.MaxGone are kept, which bounds the size of a snapshot.
 // It must run before the log up to index is dropped (the lock must be held).
 func (n *Node) goneAfter(index int) []Member {
 	gone := append([]Member(nil), n.snapshotGone...)
@@ -325,8 +339,8 @@ func (n *Node) goneAfter(index int) []Member {
 		}
 		prev = cur
 	}
-	if len(gone) > maxGone {
-		gone = gone[len(gone)-maxGone:]
+	if len(gone) > n.cfg.MaxGone {
+		gone = gone[len(gone)-n.cfg.MaxGone:]
 	}
 	return gone
 }
@@ -382,7 +396,8 @@ func (n *Node) notifyDeparting() {
 			continue
 		}
 		d.inflight = true
-		d.nextTry = now.Add(departRetry * n.cfg.HeartbeatInterval)
+		d.nextTry = now.Add(time.Duration(departWait(d.tries)) * n.cfg.HeartbeatInterval)
+		d.tries++
 		go func(id int) {
 			n.replicateTo(id)
 			n.mu.Lock()

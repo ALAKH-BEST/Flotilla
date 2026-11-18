@@ -21,6 +21,7 @@ type cluster struct {
 	n         int
 	snapEvery int // take a snapshot every this many applied entries (0 = never)
 	chunk     int // snapshot chunk size in bytes (0 = the default)
+	maxGone   int // Config.MaxGone (0 = the default)
 	storages  []*raft.MemoryStorage
 	nodes     []*raft.Node
 	stores    []*kv.Store
@@ -90,8 +91,15 @@ func newSnapshotCluster(t *testing.T, n, snapEvery int) *cluster {
 // can be started later with join and added to the cluster with AddServer.
 func newMemberCluster(t *testing.T, initial, total, snapEvery int) *cluster {
 	t.Helper()
+	return newMemberClusterWith(t, initial, total, snapEvery, 0)
+}
+
+// newMemberClusterWith also sets Config.MaxGone on every node (0 = the default).
+func newMemberClusterWith(t *testing.T, initial, total, snapEvery, maxGone int) *cluster {
+	t.Helper()
 	n := total
 	c := &cluster{
+		maxGone:   maxGone,
 		initial:   initial,
 		joining:   make([]bool, n),
 		snapEvery: snapEvery,
@@ -144,6 +152,7 @@ func (c *cluster) start(i int) {
 		Seed:      int64(i + 1),
 
 		SnapshotChunkSize: c.chunk,
+		MaxGone:           c.maxGone,
 		OnRemoved: func() {
 			c.mu.Lock()
 			c.removed[i]++
