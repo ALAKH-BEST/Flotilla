@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/ALAKH-BEST/flotilla/kv"
 	"github.com/ALAKH-BEST/flotilla/raft"
@@ -24,9 +26,12 @@ type HTTPOptions struct {
 
 // HTTPHandler returns the client API:
 //
-//	GET    /kv/{key}   the value (404 if the key does not exist)
-//	PUT    /kv/{key}   set the key to the request body
+//	GET    /kv/{key}   the value (404 if the key does not exist); the header X-Expires-At holds
+//	                   the key's expiry in Unix milliseconds if it has a time to live
+//	PUT    /kv/{key}   set the key to the request body; with ?ttl=30 (seconds, or a duration such
+//	                   as 1m30s) the key is removed after that long
 //	DELETE /kv/{key}   remove the key
+//	GET    /watch      a stream of changes (server-sent events); see the comment on watch
 //	GET    /status     this node's view of the cluster, as JSON
 //	GET    /healthz    200 while this node is running, 503 once the cluster has removed it
 //	GET    /metrics    this node's state as Prometheus gauges (plain text)
@@ -55,6 +60,9 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if res.ExpireAt > 0 {
+			w.Header().Set("X-Expires-At", strconv.FormatInt(res.ExpireAt, 10))
+		}
 		_, _ = io.WriteString(w, res.Value)
 	})
 	mux.HandleFunc("PUT /kv/{key}", func(w http.ResponseWriter, r *http.Request) {
@@ -63,10 +71,20 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 			http.Error(w, "value too large or unreadable", http.StatusRequestEntityTooLarge)
 			return
 		}
-		if _, ok := s.serve(w, r, opts, kv.OpPut, r.PathValue("key"), string(body)); ok {
+		var expireAt int64
+		if v := r.URL.Query().Get("ttl"); v != "" {
+			ttl, err := parseTTL(v)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			expireAt = s.now().Add(ttl).UnixMilli()
+		}
+		if _, ok := s.serveWith(w, r, opts, kv.Command{Op: kv.OpPut, Key: r.PathValue("key"), Value: string(body), ExpireAt: expireAt}); ok {
 			w.WriteHeader(http.StatusNoContent)
 		}
 	})
+	mux.HandleFunc("GET /watch", s.watch)
 	mux.HandleFunc("DELETE /kv/{key}", func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := s.serve(w, r, opts, kv.OpDelete, r.PathValue("key"), ""); ok {
 			w.WriteHeader(http.StatusNoContent)
@@ -178,11 +196,14 @@ func (s *Server) HTTPHandler(opts HTTPOptions) http.Handler {
 // serve runs one command and writes an error response if it fails. It reports whether the caller
 // should write the success response.
 func (s *Server) serve(w http.ResponseWriter, r *http.Request, opts HTTPOptions, op kv.Op, key, value string) (kv.Result, bool) {
-	if key == "" {
+	return s.serveWith(w, r, opts, kv.Command{Op: op, Key: key, Value: value})
+}
+
+func (s *Server) serveWith(w http.ResponseWriter, r *http.Request, opts HTTPOptions, cmd kv.Command) (kv.Result, bool) {
+	if cmd.Key == "" {
 		http.Error(w, "empty key", http.StatusBadRequest)
 		return kv.Result{}, false
 	}
-	cmd := kv.Command{Op: op, Key: key, Value: value}
 	if id, seq := r.Header.Get("X-Client-ID"), r.Header.Get("X-Seq"); id != "" || seq != "" {
 		var err1, err2 error
 		cmd.ClientID, err1 = strconv.ParseInt(id, 10, 64)
@@ -226,5 +247,137 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, opts HTTPOptions, 
 		http.Error(w, err.Error(), http.StatusGatewayTimeout)
 	default: // including raft.ErrNotReady: a new leader that cannot yet accept this, so try again
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	}
+}
+
+// maxTTL keeps an expiry well inside what a Unix-millisecond timestamp can hold.
+const maxTTL = 10 * 365 * 24 * time.Hour
+
+// parseTTL reads a time to live given as whole seconds ("30") or a duration ("1m30s").
+func parseTTL(v string) (time.Duration, error) {
+	var d time.Duration
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if secs > int64(maxTTL/time.Second) {
+			return 0, fmt.Errorf("ttl %q is longer than the %v maximum", v, maxTTL)
+		}
+		d = time.Duration(secs) * time.Second
+	} else if d, err = time.ParseDuration(v); err != nil {
+		return 0, fmt.Errorf("ttl %q is neither seconds nor a duration such as 1m30s", v)
+	}
+	if d <= 0 || d > maxTTL {
+		return 0, fmt.Errorf("ttl %q must be positive and at most %v", v, maxTTL)
+	}
+	return d, nil
+}
+
+// watch streams changes as server-sent events:
+//
+//	GET /watch?key=K         changes to the key K
+//	GET /watch?prefix=P      changes to every key starting with P (an empty P means every key)
+//	    &from=N              start at log index N, replaying what this node still holds; without
+//	                         it, only changes from now on. The Last-Event-ID header (which
+//	                         EventSource sends when it reconnects) means "after that index".
+//
+// The stream opens with event: ready and {"from": N}, the first index it will report. Each event has id: the log index, event: put, delete or expire, and data: a JSON object with the
+// index, type, key and for puts the value and expiry. Any node serves a watch, the leader or not:
+// events come in log order with none missing and none repeated, but a follower may be behind the
+// leader. If the node no longer holds the history asked for, or the watcher falls so far behind
+// that it was dropped, the answer is 410 Gone (or, mid-stream, an event: compacted) with the
+// oldest index available; read the keys again and watch from the index of that read.
+func (s *Server) watch(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	var match func(string) bool
+	switch {
+	case q.Has("key") && !q.Has("prefix"):
+		key := q.Get("key")
+		if key == "" {
+			http.Error(w, "empty key", http.StatusBadRequest)
+			return
+		}
+		match = func(k string) bool { return k == key }
+	case q.Has("prefix") && !q.Has("key"):
+		prefix := q.Get("prefix")
+		match = func(k string) bool { return strings.HasPrefix(k, prefix) }
+	default:
+		http.Error(w, "want /watch?key=K or /watch?prefix=P", http.StatusBadRequest)
+		return
+	}
+	from := 0
+	if v := q.Get("from"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			http.Error(w, "from must be a log index of 1 or more", http.StatusBadRequest)
+			return
+		}
+		from = n
+	} else if id := r.Header.Get("Last-Event-ID"); id != "" {
+		n, err := strconv.Atoi(id)
+		if err != nil || n < 0 {
+			http.Error(w, "Last-Event-ID must be a log index", http.StatusBadRequest)
+			return
+		}
+		from = n + 1
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming is not supported here", http.StatusInternalServerError)
+		return
+	}
+	watcher, err := s.store.Watch(from, match)
+	var compacted *kv.CompactedError
+	if errors.As(err, &compacted) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusGone)
+		_ = json.NewEncoder(w).Encode(map[string]int{"oldest": compacted.Oldest})
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer watcher.Close()
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	go func() {
+		select {
+		case <-s.stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	// Say where the stream starts, so a client that asked for "from now" knows which index to
+	// resume from if the connection drops before the first change.
+	fmt.Fprintf(w, "event: ready\ndata: {\"from\":%d}\n\n", watcher.Start())
+	flusher.Flush()
+	for {
+		wait, stop := context.WithTimeout(ctx, 15*time.Second)
+		events, err := watcher.Next(wait)
+		stop()
+		switch {
+		case errors.As(err, &compacted):
+			fmt.Fprintf(w, "event: compacted\ndata: {\"oldest\":%d}\n\n", compacted.Oldest)
+			flusher.Flush()
+			return
+		case errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil:
+			_, _ = io.WriteString(w, ": keep-alive\n\n") // also notices a client that went away
+			flusher.Flush()
+			continue
+		case err != nil:
+			return
+		}
+		for _, e := range events {
+			data, _ := json.Marshal(e)
+			if _, err := fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", e.Index, e.Type, data); err != nil {
+				return
+			}
+		}
+		flusher.Flush()
 	}
 }
