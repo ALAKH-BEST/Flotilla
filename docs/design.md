@@ -31,6 +31,24 @@ How Flotilla works, and how it is tested. Section numbers refer to the [Raft pap
 - **Writes** go through the log. A client numbers its requests and retries with the same number; the store remembers each client's latest request and its result, so a retry after a timeout or leader change does not run twice.
 - **Reads** use the read index (section 6.4). The leader notes its commit index, confirms with one round of heartbeats that a majority still accepts it as leader, waits for its state machine to reach that index, then answers from local state. That writes nothing to the log or the disk. Right after an election, before the new leader has committed an entry of its own term, its commit index may be behind, so reads fall back to the log until it has. `Config.LogReads` forces reads through the log.
 
+## Time to live
+
+A key written with an expiry (`ExpireAt`, in Unix milliseconds, fixed by the node that took the request) is removed by a command in the log, never by a replica looking at its own clock.
+
+- The leader looks for expired keys every `Config.ReapInterval` (default 250 ms) and proposes `OpExpire{key, ExpireAt}` for each. Every replica applies it at the same log index. It removes the key only if the key still has exactly that expiry, so a key that was written again, with a new time or none, is left alone, and a duplicate proposal from a leader that changed meanwhile does nothing.
+- Reads do not look at the clock, so a key past its time is still returned until its removal commits. That makes a time to live a lower bound: the key lives at least that long and is removed shortly after (about the reap interval, and longer while the cluster has no leader). The reason is linearizability. If reads hid expired keys using the serving node's clock, a key one leader had stopped returning could come back under a new leader whose clock is slightly behind. With removal in the log, there is one point at which the key disappears and it stays gone.
+- `Expired` scans every key that has an expiry on each tick, which is fine for thousands of them; a heap would be the change for millions.
+- A snapshot carries the expiries (`expires`, absent in snapshots from earlier versions, which still load).
+
+## Watches
+
+Every replica records each change as an event (`put`, `delete`, or `expire` for a removal by time to live) with the log index of the command that made it. Commands that change nothing (a delete of a missing key, a retried request, a no-op) record nothing.
+
+- A watcher is a cursor into that history, not a queue: the store keeps the last `Config.MaxEvents` events (default 10,000) and each watcher remembers the next index it needs, so a slow client costs no memory and cannot block the state machine.
+- Events come in log order with none missing and none repeated. Because every replica applies the same log, the same index means the same event on every node, so a client can resume on a different node from the last index it saw (`from=N`, or `Last-Event-ID`, which a browser's `EventSource` sends by itself).
+- The store knows the highest index whose event may have been dropped (`floor`). Asking to start at or below it is refused (`410 Gone`, with the oldest index still held), and a watcher that falls behind it while connected gets `event: compacted` and the stream ends. Installing a snapshot jumps the state forward without events, so it moves the floor to the snapshot's index. In every case the client reads the keys again and watches from the index of that read; the history is never silently skipped.
+- Any node serves a watch, the leader or not. A follower may be behind the leader, but never out of order. The stream opens with `event: ready` giving the first index it will report, so a client that asked for "from now" knows where to resume if the connection drops before the first change.
+
 ## Membership changes
 
 - One server is added or removed at a time (section 6, single-server changes). Any majority of the old voters overlaps any majority of the new ones, so two leaders cannot be elected in the same term across a change.
@@ -71,6 +89,8 @@ How Flotilla works, and how it is tested. Section numbers refer to the [Raft pap
 - a leadership transfer makes exactly the chosen node leader without waiting out a timeout, catches a lagging target up first, is cancelled when the target never takes over (the leader refuses commands meanwhile and then resumes), refuses a follower, a stranger and a learner, and a timeout-now from anyone but the current leader is ignored
 - the file storage appends instead of rewriting, round-trips a random history of appends, tail rewrites, term changes and snapshots, recovers the right state when the file is cut at every possible byte, reports damage in the middle of the file, and reads the old single-file format
 - a snapshot remembers far more than 16 removed servers by default, `Config.MaxGone` bounds it and keeps the most recent, and a removed server is retried at growing intervals
+- a time to live removes the key through a committed command on every replica, including after the leader changes; renewing or rewriting a key beats an earlier expire; reads never depend on a clock; snapshots carry expiries and old ones still load
+- watches deliver changes in log order with their indexes, filter by key or prefix, resume by index on another node, refuse history that was dropped (also across a snapshot), and say where the stream starts
 - reads add nothing to the log, a follower refuses them, a new leader refuses a read index until it has committed in its term, and a read waits for the state machine to catch up
 
 Every applied entry is also compared across replicas, and the test fails if two nodes ever disagree at the same index.

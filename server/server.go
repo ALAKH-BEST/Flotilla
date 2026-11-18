@@ -39,6 +39,12 @@ type Config struct {
 	// LogReads sends gets through the replicated log like writes instead of using the read
 	// index. It is slower and exists for comparison and testing.
 	LogReads bool
+	// ReapInterval is how often the leader looks for keys whose time to live has run out and
+	// proposes their removal. Zero means 250 milliseconds. A key can therefore outlive its time to
+	// live by about this long, and by longer while the cluster has no leader.
+	ReapInterval time.Duration
+	// MaxEvents is how many recent changes a node keeps for watchers to resume from (0 = 10,000).
+	MaxEvents int
 }
 
 type outcome struct {
@@ -64,6 +70,8 @@ type Server struct {
 	snapshotEvery int
 	timeout       time.Duration
 	logReads      bool
+	reapEvery     time.Duration
+	now           func() time.Time // the clock, replaceable in tests
 
 	mu      sync.Mutex
 	waiters map[int]*waiter // requests waiting for their log index to commit
@@ -89,9 +97,19 @@ func New(cfg Config) (*Server, error) {
 	if timeout == 0 {
 		timeout = 2 * time.Second
 	}
+	reap := cfg.ReapInterval
+	if reap == 0 {
+		reap = 250 * time.Millisecond
+	}
+	store := kv.NewStore()
+	if cfg.MaxEvents > 0 {
+		store.SetMaxEvents(cfg.MaxEvents)
+	}
 	return &Server{
+		reapEvery:     reap,
+		now:           time.Now,
 		node:          node,
-		store:         kv.NewStore(),
+		store:         store,
 		applyCh:       applyCh,
 		snapshotEvery: cfg.SnapshotEvery,
 		timeout:       timeout,
@@ -103,8 +121,9 @@ func New(cfg Config) (*Server, error) {
 
 // Start runs the server.
 func (s *Server) Start() {
-	s.wg.Add(1)
+	s.wg.Add(2)
 	go s.applyLoop()
+	go s.reapLoop()
 	s.node.Start()
 }
 
@@ -319,8 +338,51 @@ func (s *Server) readLocal(ctx context.Context, key string) (kv.Result, error) {
 	if err := s.waitApplied(ctx, index); err != nil {
 		return fail(err)
 	}
-	v, ok := s.store.Get(key)
-	return kv.Result{Value: v, Found: ok}, nil
+	return s.store.GetEntry(key), nil
+}
+
+// reapLoop turns expired keys into committed removals. Only the leader does it. The removal goes
+// through the log, so every replica deletes the key at the same point, and a read never depends on
+// a clock: a key that is past its time but not yet removed is still returned, which keeps reads
+// linearizable across a change of leader.
+func (s *Server) reapLoop() {
+	defer s.wg.Done()
+	tick := time.NewTicker(s.reapEvery)
+	defer tick.Stop()
+	type sent struct {
+		at   int64
+		when time.Time
+	}
+	proposed := make(map[string]sent) // so a slow commit is not proposed again every tick
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-tick.C:
+		}
+		if s.node.Status().Role != raft.Leader {
+			proposed = make(map[string]sent)
+			continue
+		}
+		now := s.now()
+		for _, e := range s.store.Expired(now.UnixMilli(), 100) {
+			if p, ok := proposed[e.Key]; ok && p.at == e.ExpireAt && now.Sub(p.when) < 2*time.Second {
+				continue
+			}
+			s.mu.Lock()
+			_, _, isLeader := s.node.Propose(kv.Encode(kv.Command{Op: kv.OpExpire, Key: e.Key, ExpireAt: e.ExpireAt}))
+			s.mu.Unlock()
+			if !isLeader {
+				break
+			}
+			proposed[e.Key] = sent{e.ExpireAt, now}
+		}
+		for k, p := range proposed {
+			if now.Sub(p.when) > 10*time.Second {
+				delete(proposed, k)
+			}
+		}
+	}
 }
 
 // waitApplied blocks until the state machine has applied up to index.

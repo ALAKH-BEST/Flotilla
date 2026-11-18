@@ -20,6 +20,7 @@ type kvCluster struct {
 	initial   int    // the first initial nodes form the starting cluster
 	joining   []bool // nodes started with Join, to be added later
 	snapEvery int
+	maxEvents int
 	storages  []*raft.MemoryStorage
 
 	mu      sync.Mutex
@@ -34,8 +35,15 @@ func newKVCluster(t *testing.T, n, snapEvery int) *kvCluster {
 // started later with joinStart and added with AddServer.
 func newKVMemberCluster(t *testing.T, initial, total, snapEvery int) *kvCluster {
 	t.Helper()
+	return newKVClusterOpts(t, initial, total, snapEvery, 0)
+}
+
+// newKVClusterOpts also sets how many recent changes each node keeps for watchers (0 = default).
+func newKVClusterOpts(t *testing.T, initial, total, snapEvery, maxEvents int) *kvCluster {
+	t.Helper()
 	n := total
 	c := &kvCluster{
+		maxEvents: maxEvents,
 		t:         t,
 		net:       simnet.New(7),
 		n:         n,
@@ -77,6 +85,8 @@ func (c *kvCluster) start(i int) {
 		},
 		SnapshotEvery:  c.snapEvery,
 		RequestTimeout: time.Second,
+		ReapInterval:   20 * time.Millisecond,
+		MaxEvents:      c.maxEvents,
 	})
 	if err != nil {
 		c.t.Fatalf("server %d: %v", i, err)

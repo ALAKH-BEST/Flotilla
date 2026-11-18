@@ -9,6 +9,7 @@ Raft keeps a cluster of nodes agreeing on one ordered log even when nodes crash 
 - A key-value state machine with exactly-once writes and linearizable reads that cost no log entry
 - Cluster membership changes while running: add (through a non-voting learner) and remove, the leader included
 - Leadership transfer: hand leadership to a chosen node before maintenance, with no election timeout to wait out
+- Keys with a time to live, removed by a committed command so every replica agrees, and watches that stream changes in log order and resume from an index on any node
 - Real processes over TCP with an HTTP API, a command-line client and on-disk state
 - Tested with injected faults and a linearizability checker over recorded histories
 
@@ -69,8 +70,16 @@ To take the leader down without clients waiting for an election, hand leadership
 ./flotilla transfer -server 127.0.0.1:8000 2     # node 2 becomes leader
 ```
 
+A key can expire, and any key can be watched:
 
-The HTTP API is `GET|PUT|DELETE /kv/{key}`, `GET /status`, `GET /healthz` (503 once the node is removed from the cluster), `GET /metrics` (Prometheus gauges: leader, term, commit and log indexes, members), and for membership `GET /admin/members`, `PUT /admin/members/{id}` (the body is the node's address) and `DELETE /admin/members/{id}`, and `PUT /admin/leader/{id}` to hand leadership to voter `{id}` (204 once the leader has stepped down, 409 if `{id}` cannot lead, 504 if it did not take over in time and the leader carries on).
+```sh
+./flotilla put -server 127.0.0.1:8000 -ttl 30 session abc   # removed after about 30 seconds
+./flotilla watch -server 127.0.0.1:8000,127.0.0.1:8001 -prefix user:    # prints each change as it happens
+```
+
+`watch` reconnects to the next address if its node goes away and carries on after the last change it printed, so nothing is missed or repeated. `-from N` replays from log index `N` first, as far back as the node still keeps (the last 10,000 changes by default); older than that it says so and stops, and the keys should be read again.
+
+The HTTP API is `GET|PUT|DELETE /kv/{key}` (`PUT /kv/{key}?ttl=30` sets a time to live, in seconds or as a duration such as `1m30s`, and `GET` then returns the expiry in the `X-Expires-At` header, in Unix milliseconds), `GET /watch?key=K` or `GET /watch?prefix=P` (a stream of server-sent events, with `&from=N` or a `Last-Event-ID` header to resume; 410 if that history is gone), `GET /status`, `GET /healthz` (503 once the node is removed from the cluster), `GET /metrics` (Prometheus gauges: leader, term, commit and log indexes, members), and for membership `GET /admin/members`, `PUT /admin/members/{id}` (the body is the node's address) and `DELETE /admin/members/{id}`, and `PUT /admin/leader/{id}` to hand leadership to voter `{id}` (204 once the leader has stepped down, 409 if `{id}` cannot lead, 504 if it did not take over in time and the leader carries on).
 
 ## Use as a library
 
