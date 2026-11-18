@@ -143,4 +143,4 @@ How it works and what is tested in detail: [docs/design.md](docs/design.md).
 
 ## Not done
 
-Only the 16 most recent removals are remembered across compactions, so a removed server that stays away through more removals than that is never told. Details in the design notes.
+A snapshot remembers the 1,024 most recent removed servers (`Config.MaxGone`), so a removed server that stays away through more removals than that is never told. It is harmless, since a removed server cannot campaign, but it has to be stopped by hand. Details in the design notes.

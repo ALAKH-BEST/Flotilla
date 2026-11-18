@@ -49,6 +49,9 @@ type Config struct {
 	ElectionTimeoutMax time.Duration
 	HeartbeatInterval  time.Duration
 	TickInterval       time.Duration
+	// MaxGone is how many removed servers a snapshot remembers, so that a leader elected later can
+	// still tell them they were removed (default 1024). Older ones are forgotten and never told.
+	MaxGone int
 	// TransferTimeout is how long a leadership transfer may take before the leader gives up and
 	// carries on (default 2 seconds).
 	TransferTimeout time.Duration
@@ -186,6 +189,9 @@ func New(cfg Config) (*Node, error) {
 	}
 	if cfg.TickInterval == 0 {
 		cfg.TickInterval = defaultTickInterval
+	}
+	if cfg.MaxGone <= 0 {
+		cfg.MaxGone = defaultMaxGone
 	}
 	if cfg.TransferTimeout == 0 {
 		cfg.TransferTimeout = defaultTransferTimeout
