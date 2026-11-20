@@ -79,6 +79,19 @@ type Node struct {
 	applyCond *sync.Cond
 	rng       *rand.Rand
 
+	// Group commit. A command is appended to the log under mu, then mu is let go while the log is
+	// made durable, so other commands can be appended meanwhile and all of them share one sync.
+	// dirty counts the commands appended; durable is how many of them are known to be on disk.
+	// Every save of the whole state (persist, or the syncer's) is numbered by capSeq as it is
+	// captured under mu, and saveMu keeps the saves in that order, dropping a capture that a newer
+	// one has already overtaken, so an older state is never written over a newer one.
+	syncCond *sync.Cond // on mu: a command was appended, or durable moved, or the node stopped
+	dirty    uint64
+	durable  uint64
+	capSeq   uint64
+	saveMu   sync.Mutex
+	savedCap uint64 // guarded by saveMu
+
 	// Persistent state (saved to Storage before replying to any RPC that changes it).
 	currentTerm int
 	votedFor    int // -1 when the node has not voted this term
@@ -223,6 +236,7 @@ func New(cfg Config) (*Node, error) {
 		stopCh:          make(chan struct{}),
 	}
 	n.applyCond = sync.NewCond(&n.mu)
+	n.syncCond = sync.NewCond(&n.mu)
 
 	state, ok, err := cfg.Storage.Load()
 	if err != nil {
@@ -266,9 +280,10 @@ func (n *Node) Start() {
 	if n.cfg.OnMembership != nil {
 		n.cfg.OnMembership(append([]Member(nil), n.members...))
 	}
-	n.wg.Add(2)
+	n.wg.Add(3)
 	go n.run()
 	go n.applier()
+	go n.syncer()
 }
 
 // Stop shuts the node down and waits for its background goroutines. It is safe to call more than once.
@@ -277,6 +292,7 @@ func (n *Node) Stop() {
 	n.stopped = true
 	n.failReads(ErrStopped)
 	n.applyCond.Broadcast()
+	n.syncCond.Broadcast()
 	n.mu.Unlock()
 	n.stopOnce.Do(func() { close(n.stopCh) })
 	n.wg.Wait()
@@ -285,6 +301,9 @@ func (n *Node) Stop() {
 // Propose appends a command to the log if this node is the leader. It returns the
 // index and term the command will have if it is committed. A true isLeader does
 // not guarantee the command commits: the leader can lose its role first.
+//
+// Propose returns once the command is on this node's disk and has been sent to the followers.
+// Commands proposed at the same time are written with one sync and sent in one round of messages.
 func (n *Node) Propose(command []byte) (index, term int, isLeader bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -292,12 +311,29 @@ func (n *Node) Propose(command []byte) (index, term int, isLeader bool) {
 		return 0, n.currentTerm, false
 	}
 	n.log = append(n.log, Entry{Term: n.currentTerm, Command: command})
-	n.persist()
-	index = n.lastLogIndex()
-	n.matchIndex[n.cfg.ID] = index
-	n.broadcastAppendEntries()
-	n.advanceCommit() // a single-node cluster commits immediately
-	return index, n.currentTerm, true
+	index, term = n.lastLogIndex(), n.currentTerm
+	n.dirty++
+	mine := n.dirty
+	n.syncCond.Broadcast() // wake the syncer
+	for n.durable < mine && !n.stopped {
+		n.syncCond.Wait() // lets go of mu, so more commands can be appended meanwhile
+	}
+	if n.stopped {
+		return 0, term, false
+	}
+	if n.role != Leader || n.currentTerm != term || index > n.lastLogIndex() ||
+		(index > n.snapshotIndex && n.termAt(index) != term) {
+		return index, term, true // leadership was lost while the sync ran; the caller finds out when the entry never commits
+	}
+	// Normally the syncer has already counted this node as holding the entry and sent it out, once
+	// for the whole batch. If the entry became durable some other way (a save made for another
+	// reason), do that here.
+	if index > n.matchIndex[n.cfg.ID] {
+		n.matchIndex[n.cfg.ID] = index
+		n.broadcastAppendEntries()
+		n.advanceCommit() // a single-node cluster commits immediately
+	}
+	return index, term, true
 }
 
 // Status reports the node's current state.
@@ -474,8 +510,25 @@ func (n *Node) resetElectionDeadline() {
 // persist saves the persistent state. If storage fails the node cannot keep its
 // promises (a vote or an acknowledged entry could be forgotten after a restart),
 // so it stops rather than carry on.
+//
+// It saves while holding the node's lock, so nothing else changes meanwhile and the caller can
+// reply as soon as it returns. Everything in the log is durable afterwards, including commands
+// that Propose is still waiting on.
 func (n *Node) persist() {
-	err := n.cfg.Storage.Save(State{
+	n.capSeq++
+	capture, dirty := n.capSeq, n.dirty
+	if err := n.save(capture, n.captureState()); err != nil {
+		panic(fmt.Sprintf("raft: node %d cannot persist state: %v", n.cfg.ID, err))
+	}
+	if dirty > n.durable {
+		n.durable = dirty
+		n.syncCond.Broadcast()
+	}
+}
+
+// captureState copies what must survive a restart. It needs mu.
+func (n *Node) captureState() State {
+	return State{
 		CurrentTerm:   n.currentTerm,
 		VotedFor:      n.votedFor,
 		Log:           append([]Entry(nil), n.log...),
@@ -485,9 +538,58 @@ func (n *Node) persist() {
 
 		SnapshotMembers: n.snapshotMembers,
 		SnapshotGone:    n.snapshotGone,
-	})
-	if err != nil {
-		panic(fmt.Sprintf("raft: node %d cannot persist state: %v", n.cfg.ID, err))
+	}
+}
+
+// save writes a captured state unless a newer capture has already been written.
+func (n *Node) save(capture uint64, state State) error {
+	n.saveMu.Lock()
+	defer n.saveMu.Unlock()
+	if capture <= n.savedCap {
+		return nil
+	}
+	if err := n.cfg.Storage.Save(state); err != nil {
+		return err
+	}
+	n.savedCap = capture
+	return nil
+}
+
+// syncer makes appended commands durable. While one sync runs, more commands are appended and
+// wait; the next sync then covers them all.
+func (n *Node) syncer() {
+	defer n.wg.Done()
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for {
+		for n.durable >= n.dirty && !n.stopped {
+			n.syncCond.Wait()
+		}
+		if n.stopped {
+			return
+		}
+		n.capSeq++
+		capture, dirty, state := n.capSeq, n.dirty, n.captureState()
+		last, term := n.lastLogIndex(), n.currentTerm
+		n.mu.Unlock()
+		err := n.save(capture, state)
+		n.mu.Lock()
+		if err != nil {
+			panic(fmt.Sprintf("raft: node %d cannot persist state: %v", n.cfg.ID, err))
+		}
+		// The log up to last is on disk. If this node still leads in the term it was captured in,
+		// it now counts itself as holding those entries (its own vote waits for its disk) and sends
+		// them to the followers: one round of messages for the whole batch.
+		if n.role == Leader && n.currentTerm == term && last > n.matchIndex[n.cfg.ID] &&
+			last <= n.lastLogIndex() && (last <= n.snapshotIndex || n.termAt(last) == term) {
+			n.matchIndex[n.cfg.ID] = last
+			n.broadcastAppendEntries()
+			n.advanceCommit() // a single-node cluster commits immediately
+		}
+		if dirty > n.durable {
+			n.durable = dirty
+			n.syncCond.Broadcast()
+		}
 	}
 }
 
